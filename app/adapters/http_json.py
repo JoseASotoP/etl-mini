@@ -4,20 +4,34 @@ from __future__ import annotations
 """
 Adaptador HTTP JSON y utilidades de resolución/selección de registros.
 
-Provee `_resolve_now_token` para tokens de tiempo, `_dig` para navegar
-objetos anidados y `HTTPJSONAdapter` para consumir APIs JSON con
-paginación ligera y transformaciones específicas (Open-Meteo, USGS).
+Provee:
+- `_resolve_now_token` para tokens de tiempo relativos a "ahora".
+- `_dig` para navegar objetos anidados (dict/list) por una cadena de claves.
+- `HTTPJSONAdapter` para consumir APIs JSON con transforms específicas
+  (Open-Meteo, USGS) o ruta genérica usando `urllib`.
+- `AdapterHTTPJSON` como variante declarativa basada en `requests` +
+  `apply_simple_transforms` y carga directa a DuckDB (`load_to_duckdb`).
+
+Esto permite dos estilos de uso:
+1) Adaptador clásico que sólo hace `fetch()` y deja el resto al pipeline.
+2) Adaptador "todo en uno" que trae, transforma y carga.
 """
 
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Union, Tuple
 from datetime import datetime, timedelta, timezone
 import json
 import urllib.parse
 import urllib.request
 
+import requests
 import pandas as pd
 
-from .base import BaseAdapter, register_adapter
+from .base import (
+    BaseAdapter,
+    register_adapter,
+    apply_simple_transforms,
+    load_to_duckdb,
+)
 
 
 def _resolve_now_token(val: str) -> str:
@@ -249,3 +263,113 @@ class HTTPJSONAdapter(BaseAdapter):
             df[k] = v
 
         return df
+
+
+@register_adapter("http_json_simple")
+class AdapterHTTPJSON:
+    """
+    Variante declarativa de adaptador HTTP→JSON con carga integrada.
+
+    Flujo:
+    1) Hace `GET` con `requests` (`url`, `query`, `headers`, `timeout`).
+    2) Normaliza JSON con `pd.json_normalize` (soporta `record_path`).
+    3) Aplica `apply_simple_transforms(df, params)` para select/rename/derive/…
+    4) Carga a DuckDB con `load_to_duckdb`.
+
+    Parámetros adicionales útiles:
+    - root_index: int, para apis que devuelven lista/tupla en la raíz (p. ej. World Bank).
+    - hourly_to_rows: dict con
+        { "time_field": "...", "value_field": "...", "constant_fields": {...} }
+      para Open-Meteo (conversión de hourly a filas).
+    - record_path: lista/str para `pd.json_normalize`.
+    - flatten_sep: separador de columnas anidadas (por defecto ".").
+
+    Notes
+    -----
+    Registra el adaptador como "http_json_simple" en el registro global y
+    además exporta la variable de módulo `Adapter` para posibles cargas
+    dinámicas externas.
+    """
+    def __init__(self, params: Dict[str, Any], context: Dict[str, Any]):
+        """
+        Parameters
+        ----------
+        params : Dict[str, Any]
+            Configuración de la fuente (url, query, headers, transforms…).
+        context : Dict[str, Any]
+            Debe incluir `db_path`, `table` y opcionalmente `mode`.
+        """
+        self.p = params or {}
+        self.ctx = context or {}
+
+    def run(self) -> Tuple[str, int, float]:
+        """
+        Ejecuta obtención → normalización → transformaciones → carga.
+
+        Returns
+        -------
+        Tuple[str, int, float]
+            (tabla, filas_insertadas, duración_en_segundos)
+
+        Notes
+        -----
+        La duración no se cronometra finamente aquí; devuelve 0.0.
+        """
+        url = self.p["url"]
+        query = self.p.get("query") or {}
+        headers = self.p.get("headers") or {}
+
+        resp = requests.get(
+            url,
+            params=query,
+            headers=headers,
+            timeout=self.p.get("timeout", 30),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # world bank: raíz en índice 1
+        if "root_index" in self.p:
+            data = data[self.p["root_index"]]
+
+        df: pd.DataFrame | None = None
+
+        # open-meteo: hourly_to_rows
+        if self.p.get("hourly_to_rows"):
+            h = (data or {}).get("hourly") or {}
+            tf = self.p["hourly_to_rows"]["time_field"]
+            vf = self.p["hourly_to_rows"]["value_field"]
+            df = pd.DataFrame({tf: h.get(tf, []), vf: h.get(vf, [])})
+            # constantes
+            for k, v in (self.p["hourly_to_rows"].get("constant_fields") or {}).items():
+                df[k] = v
+
+        # usgs / genérico: record_path + flatten
+        if df is None:
+            record_path = self.p.get("record_path")
+            if record_path:
+                df = pd.json_normalize(
+                    data,
+                    record_path=record_path,
+                    sep=self.p.get("flatten_sep", "."),
+                )
+            else:
+                df = pd.json_normalize(
+                    data,
+                    sep=self.p.get("flatten_sep", "."),
+                )
+
+        # transforms declarativas
+        df = apply_simple_transforms(df, self.p)
+
+        # cargar
+        table = self.ctx["table"]
+        mode = self.ctx.get("mode", "replace")
+        rows = load_to_duckdb(df, self.ctx["db_path"], table, mode)
+
+        # duración no cronometrada finamente aquí; devuelve 0.0 como placeholder
+        return table, rows, 0.0
+
+
+# Export adicional para compatibilidad con cargas dinámicas externas
+Adapter = AdapterHTTPJSON
