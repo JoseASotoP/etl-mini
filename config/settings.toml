@@ -1,0 +1,86 @@
+defaults:
+  db_path: "data/warehouse.duckdb"
+  mode: "replace"     # replace | append
+  group: "daily"
+
+groups:
+  daily:
+    # 1) World Bank – población total España
+    - name: wb_esp_pop
+      type: http_json
+      table: wb_esp_sp_pop_totl
+      params:
+        url: "https://api.worldbank.org/v2/country/ESP/indicator/SP.POP.TOTL"
+        query:
+          format: "json"
+          per_page: 20000
+        # WB devuelve [meta, data] → cogemos índice 1
+        records_key_chain: ["1"]
+        select: ["date", "value", "indicator", "country"]
+        rename:
+          date: year
+        enrich:
+          indicator_id: "SP.POP.TOTL"
+        post:
+          cast:
+            year: int
+            value: int
+          dropna_any: ["year","value"]
+
+    # 2) Open-Meteo – PM2.5 últimas 7 jornadas en Madrid
+    - name: aq_madrid_pm25
+      type: http_json
+      table: aq_madrid_pm25
+      params:
+        url: "https://air-quality-api.open-meteo.com/v1/air-quality"
+        query:
+          latitude: 40.4168
+          longitude: -3.7038
+          hourly: "pm2_5"
+          timezone: "UTC"
+          past_days: 7
+          forecast_days: 0
+        # Estructura: { hourly: { time: [...], pm2_5: [...] } }
+        transform: "hourly_time_value"
+        transform_args:
+          time_key: "time"
+          value_key: "pm2_5"
+          parameter: "pm25"
+          unit: "µg/m³"
+          latitude: 40.4168
+          longitude: -3.7038
+        post:
+          cast:
+            value: float
+
+    # 3) USGS – Terremotos últimos 7 días magnitud >= 4
+    - name: usgs_quakes_7d_m40
+      type: http_json
+      table: usgs_quakes_7d_m40
+      params:
+        url: "https://earthquake.usgs.gov/fdsnws/event/1/query"
+        query:
+          format: "geojson"
+          starttime: "@now-7d"   # (runner resolverá)
+          endtime: "@now"
+          minmagnitude: 4.0
+          orderby: "time"
+        records_key_chain: ["features"]
+        explode_properties: "properties"
+        select:
+          - time
+          - mag
+          - place
+          - depth
+          - code
+          - type
+          - status
+        rename:
+          time: datetime_utc
+          mag: magnitude
+          depth: depth_km
+          code: event_id
+        post:
+          cast:
+            magnitude: float
+            depth_km: float

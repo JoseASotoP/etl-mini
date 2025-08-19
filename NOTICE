@@ -1,0 +1,12 @@
+etl-mini
+Copyright (c) 2025 José Antonio Soto Paredes
+
+This product is licensed under the Apache License, Version 2.0.
+
+Attributions / third‑party services referenced by this project (data is fetched at runtime and not redistributed in this repository; please review and comply with each provider's terms):
+- World Bank Open Data API — terms: https://datahelpdesk.worldbank.org/knowledgebase/articles/889392-terms-of-use-for-datasets
+- USGS Earthquake Hazards Program — policies: https://www.usgs.gov/information-policies-and-instructions
+- Open‑Meteo API — terms: https://open-meteo.com/en/terms
+- GitHub REST API — policies: https://docs.github.com/site-policy
+
+Trademarks and brand names mentioned herein are the property of their respective owners.

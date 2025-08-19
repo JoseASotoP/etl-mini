@@ -1,0 +1,29 @@
+# Entorno/IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+
+# Datos generados
+data/warehouse.duckdb
+data/reports/*
+data/plots/*
+
+# Mantener carpetas vacías
+!data/reports/.gitkeep
+!data/plots/.gitkeep
+!data/input/.gitkeep
+
+# Logs
+*.log
+
+# SO
+.DS_Store
+Thumbs.db

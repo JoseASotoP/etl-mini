@@ -1,0 +1,31 @@
+rules:
+  wb_esp_sp_pop_totl:
+    schema:
+      year: int
+      value: int
+      indicator_id: str
+    checks:
+      - not_null: ["year","value"]
+      - unique: ["year"]
+      - range: { column: "value", min: 1_000_000, max: 200_000_000 }
+    on_fail: "warn"   # o "block"
+
+  aq_madrid_pm25:
+    schema:
+      datetime_utc: datetime
+      value: float
+      parameter: str
+    checks:
+      - not_null: ["datetime_utc","value"]
+      - range: { column: "value", min: 0, max: 500 }
+    on_fail: "warn"
+
+  usgs_quakes_7d_m40:
+    schema:
+      datetime_utc: datetime
+      magnitude: float
+      depth_km: float
+    checks:
+      - not_null: ["datetime_utc","magnitude","depth_km"]
+      - range: { column: "magnitude", min: 4, max: 10 }
+    on_fail: "warn"
