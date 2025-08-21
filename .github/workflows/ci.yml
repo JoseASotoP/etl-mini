@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch: {}
   push:
     branches: [ dev, main ]
   pull_request:
@@ -24,10 +25,34 @@ jobs:
           python -m pip install --upgrade pip
           pip install duckdb pandas pyyaml requests
 
+      # Crear data/warehouse.duckdb y tablas vacías usadas por los tests
+      - name: Bootstrap local DuckDB schema for tests
+        run: |
+          python - <<'PY'
+          import os, duckdb
+          os.makedirs('data', exist_ok=True)
+          con = duckdb.connect('data/warehouse.duckdb')
+          con.execute("""
+            CREATE TABLE IF NOT EXISTS wb_esp_sp_pop_totl (
+              year INTEGER,
+              value DOUBLE,
+              indicator_id TEXT
+            )
+          """)
+          con.execute("""
+            CREATE TABLE IF NOT EXISTS aq_madrid_pm25 (
+              datetime_utc TIMESTAMP,
+              value DOUBLE,
+              parameter TEXT,
+              unit TEXT,
+              latitude DOUBLE,
+              longitude DOUBLE
+            )
+          """)
+          con.close()
+          PY
+
       - name: Smoke tests (no red de terceros)
         run: |
           python -m tests.test_v04_bigmixed_reduced
           python -m tests.test_v04_population
-
-      # Nota: evitamos runner con peticiones HTTP reales en CI.
-      # Si quieres un mock, lo añadimos luego.
