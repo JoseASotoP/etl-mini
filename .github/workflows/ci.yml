@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [ dev, main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (minimal)
+        run: |
+          python -m pip install --upgrade pip
+          pip install duckdb pandas pyyaml requests
+
+      - name: Smoke tests (no red de terceros)
+        run: |
+          python -m tests.test_v04_bigmixed_reduced
+          python -m tests.test_v04_population
+
+      # Nota: evitamos runner con peticiones HTTP reales en CI.
+      # Si quieres un mock, lo añadimos luego.
