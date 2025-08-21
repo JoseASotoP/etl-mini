@@ -1,0 +1,18 @@
+# Texto por defecto con normalización
+* text=auto
+
+# Fuerza LF en código y YAML (evita CRLF en Windows)
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.sql text eol=lf
+*.csv text eol=lf
+
+# Binarios (sin conversión)
+*.parquet -text
+*.duckdb -text
+*.png -text
+*.jpg -text
+*.zip -text
