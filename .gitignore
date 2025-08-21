@@ -37,3 +37,6 @@ data/plots/
 
 # Local dependencies / downloads
 downloads/
+
+# Local DBs
+data/*.db
