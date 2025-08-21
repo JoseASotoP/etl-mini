@@ -40,3 +40,10 @@ downloads/
 
 # Local DBs
 data/*.db
+
+# ---- Local artifacts ----
+data/warehouse.duckdb
+data/parquet/
+data/reports/
+__pycache__/
+*.log
