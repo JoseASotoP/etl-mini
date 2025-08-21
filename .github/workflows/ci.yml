@@ -1,7 +1,6 @@
 name: CI
 
 on:
-  workflow_dispatch: {}
   push:
     branches: [ dev, main ]
   pull_request:
@@ -25,30 +24,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install duckdb pandas pyyaml requests
 
-      # Crear data/warehouse.duckdb y tablas vacías usadas por los tests
+      - name: Prepare data folders
+        run: |
+          mkdir -p data data/parquet data/reports
+          mkdir -p data/parquet/bigmixed_reduced
+          mkdir -p data/parquet/bigmixed_full
+          mkdir -p data/parquet/extreme
+          mkdir -p data/parquet/aq_madrid_pm25
+
       - name: Bootstrap local DuckDB schema for tests
         run: |
           python - <<'PY'
-          import os, duckdb
-          os.makedirs('data', exist_ok=True)
+          import duckdb
           con = duckdb.connect('data/warehouse.duckdb')
-          con.execute("""
-            CREATE TABLE IF NOT EXISTS wb_esp_sp_pop_totl (
-              year INTEGER,
-              value DOUBLE,
-              indicator_id TEXT
-            )
-          """)
-          con.execute("""
-            CREATE TABLE IF NOT EXISTS aq_madrid_pm25 (
-              datetime_utc TIMESTAMP,
-              value DOUBLE,
-              parameter TEXT,
-              unit TEXT,
-              latitude DOUBLE,
-              longitude DOUBLE
-            )
-          """)
+          con.execute("CREATE TABLE IF NOT EXISTS wb_esp_sp_pop_totl (year INTEGER, value DOUBLE, indicator_id TEXT)")
+          con.execute("CREATE TABLE IF NOT EXISTS aq_madrid_pm25 (datetime_utc TIMESTAMP, value DOUBLE, parameter TEXT, unit TEXT, latitude DOUBLE, longitude DOUBLE)")
+          con.execute("CREATE TABLE IF NOT EXISTS usgs_quakes_7d_m40 (id TEXT, time TIMESTAMP, latitude DOUBLE, longitude DOUBLE, depth_km DOUBLE, magnitude DOUBLE, place TEXT)")
           con.close()
           PY
 
