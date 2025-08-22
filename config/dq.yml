@@ -18,6 +18,12 @@ rules:
     checks:
       - not_null: ["datetime_utc","value"]
       - range: { column: "value", min: 0, max: 500 }
+      # --- Regla TEMPORAL para demo fail-fast ---
+      - type: range
+        column: value
+        min: 0
+        max: 10     # ⚠️ forzará fallo DQ en la demo
+        inclusive: true
     on_fail: "warn"
 
   usgs_quakes_7d_m40:
