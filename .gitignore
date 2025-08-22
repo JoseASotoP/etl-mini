@@ -47,3 +47,8 @@ data/parquet/
 data/reports/
 __pycache__/
 *.log
+
+# Local backups
+*.bak
+serve.cmd
+
