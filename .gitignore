@@ -1,49 +1,9 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyd
-*.egg-info/
-.venv/
-venv/
-.env
-*.log
-
-# IDE / Editor / Workspace
-.vscode/
-.idea/
-*.code-workspace
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Local data & artifacts
-data/warehouse.duckdb
-data/warehouse.duckdb.wal
-data/parquet/
-data/raw/
-data/reports/
-data/plots/
-# (optional) ignore input data; comment out if you want to track it
-# data/input/
-
-# Keep placeholders within ignored data dirs
-!data/**/.gitkeep
-
-# Caches / test artifacts / notebooks
-.coverage
-.pytest_cache/
-.ipynb_checkpoints/
-
-# Local dependencies / downloads
-downloads/
-
-# Local DBs
-data/*.db
+# Local backups
+*.bak
+serve.cmd
 
 # Data
 /data/input/
 /data/reports/
 /data/parquet/
 /data/*.duckdb
-
