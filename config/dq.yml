@@ -17,8 +17,7 @@ rules:
       parameter: str
     checks:
       - not_null: ["datetime_utc","value"]
-      # ↓↓↓ Cambia SOLO este max de 500 → 10 para forzar el fallo
-      - range: { column: "value", min: 0, max: 10, inclusive: true }
+      - range: { column: "value", min: 0, max: 500, inclusive: true }
 
   usgs_quakes_7d_m40:
     schema:
