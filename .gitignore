@@ -7,3 +7,9 @@ serve.cmd
 /data/reports/
 /data/parquet/
 /data/*.duckdb
+
+# Virtualenv
+.venv/
+# DB leftovers
+/data/*.wal
+/data/*.db
