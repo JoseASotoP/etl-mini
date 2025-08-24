@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [ dev, main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (minimal)
+        run: |
+          python -m pip install --upgrade pip
+          pip install duckdb pandas pyyaml requests
+
+      - name: Prepare data folders
+        run: |
+          mkdir -p data data/parquet data/reports
+          mkdir -p data/parquet/bigmixed_reduced
+          mkdir -p data/parquet/bigmixed_full
+          mkdir -p data/parquet/extreme
+          mkdir -p data/parquet/aq_madrid_pm25
+
+      - name: Bootstrap local DuckDB schema for tests
+        run: |
+          python - <<'PY'
+          import duckdb
+          con = duckdb.connect('data/warehouse.duckdb')
+          con.execute("CREATE TABLE IF NOT EXISTS wb_esp_sp_pop_totl (year INTEGER, value DOUBLE, indicator_id TEXT)")
+          con.execute("CREATE TABLE IF NOT EXISTS aq_madrid_pm25 (datetime_utc TIMESTAMP, value DOUBLE, parameter TEXT, unit TEXT, latitude DOUBLE, longitude DOUBLE)")
+          con.execute("CREATE TABLE IF NOT EXISTS usgs_quakes_7d_m40 (id TEXT, time TIMESTAMP, latitude DOUBLE, longitude DOUBLE, depth_km DOUBLE, magnitude DOUBLE, place TEXT)")
+          con.close()
+          PY
+
+      - name: Smoke tests (no red de terceros)
+        run: |
+          python -m tests.test_v04_bigmixed_reduced
+          python -m tests.test_v04_population

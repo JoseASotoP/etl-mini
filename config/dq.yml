@@ -17,8 +17,7 @@ rules:
       parameter: str
     checks:
       - not_null: ["datetime_utc","value"]
-      - range: { column: "value", min: 0, max: 500 }
-    on_fail: "warn"
+      - range: { column: "value", min: 0, max: 500, inclusive: true }
 
   usgs_quakes_7d_m40:
     schema:
