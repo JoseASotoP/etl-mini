@@ -5,9 +5,8 @@ Nítida — UI mínima para etl-mini
 - Ejecutar cargas (runner)
 - Estado (etl_runs / etl_metrics)
 - Explorar tablas DuckDB
-- Descargar informe HTML
-- Subir e importar CSV/XLSX a DuckDB
-- Modo seguro de ejecución
+- Descargar informe HTML bajo demanda
+- Subir e importar CSV/XLSX a DuckDB (stg_*)
 
 Run:
     streamlit run app/serve.py
@@ -17,7 +16,6 @@ from __future__ import annotations
 import os
 import sys
 import re
-import io
 import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
@@ -26,34 +24,22 @@ import duckdb
 import pandas as pd
 import streamlit as st
 
-# -------- settings / fallback --------
+# --------------------------- Config básica ---------------------------
+
 try:
-    from app.utils import load_settings  # si existe
+    from app.utils import load_settings  # opcional
 except Exception:
-    load_settings = None
+    load_settings = None  # fallback
 
 DEFAULT_SETTINGS = {
     "paths": {
         "db_path": "data/warehouse.duckdb",
         "reports_dir": "data/reports",
-        "parquet_dir": "data/parquet",
     },
-    "project": {"name": "etl-mini (Nítida)", "version": "0.4.0"},
+    "project": {"name": "etl-mini (Nítida)", "version": "0.5.0"},
 }
 
-
 def get_settings() -> dict:
-    """
-    Devolver la configuración de la aplicación.
-
-    Si existe `load_settings` en app.utils, se utiliza. En caso de error o
-    ausencia, se retornan los DEFAULT_SETTINGS.
-
-    Returns
-    -------
-    dict
-        Diccionario de configuración.
-    """
     if load_settings:
         try:
             return load_settings()
@@ -61,50 +47,42 @@ def get_settings() -> dict:
             pass
     return DEFAULT_SETTINGS
 
-
 SET = get_settings()
 ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = (SET.get("paths") or {}).get("db_path", "data/warehouse.duckdb")
 REPORTS_DIR = Path((SET.get("paths") or {}).get("reports_dir", "data/reports"))
 INPUT_DIR = ROOT / "data" / "input"
 INPUT_DIR.mkdir(parents=True, exist_ok=True)
+SHOW_DEMO_RUNNER = True 
+
 
 st.set_page_config(page_title="Nítida · ETL-mini", layout="wide")
 st.title("Nítida — ETL mini")
 st.caption("KPIs rápidos, acciones clave y utilidades sobre DuckDB.")
 
+# --------------------------- Conexión ---------------------------
 
-# -------- conexión única --------
 @st.cache_resource(show_spinner=False)
 def get_con():
-    """
-    Obtener una conexión DuckDB única (cacheada para la sesión Streamlit).
-
-    Returns
-    -------
-    duckdb.DuckDBPyConnection
-        Conexión a la base de datos DuckDB.
-    """
+    import shutil
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    return duckdb.connect(DB_PATH)
+    try:
+        return duckdb.connect(DB_PATH)
+    except UnicodeDecodeError:
+        # Base dañada o fichero no-DuckDB: respalda y recrea
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            if os.path.exists(DB_PATH):
+                shutil.move(DB_PATH, f"{DB_PATH}.bad_{ts}")
+            wal = DB_PATH + ".wal"
+            if os.path.exists(wal):
+                shutil.move(wal, f"{wal}.bad_{ts}")
+        except Exception:
+            pass
+        return duckdb.connect(DB_PATH)
 
 
 def table_or_view_exists(con: duckdb.DuckDBPyConnection, name: str) -> bool:
-    """
-    Comprobar si existe una tabla o vista en el esquema 'main'.
-
-    Parameters
-    ----------
-    con : duckdb.DuckDBPyConnection
-        Conexión a DuckDB.
-    name : str
-        Nombre de la tabla o vista a verificar.
-
-    Returns
-    -------
-    bool
-        True si existe, False en caso contrario.
-    """
     q = """
     SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name=?
     UNION ALL
@@ -113,47 +91,41 @@ def table_or_view_exists(con: duckdb.DuckDBPyConnection, name: str) -> bool:
     """
     return bool(con.execute(q, [name, name]).fetchone())
 
-
 def df_safe(con: duckdb.DuckDBPyConnection, sql: str) -> pd.DataFrame:
-    """
-    Ejecutar una consulta SQL de forma segura.
-
-    Si la consulta falla, devuelve un DataFrame vacío en lugar de lanzar
-    una excepción.
-
-    Parameters
-    ----------
-    con : duckdb.DuckDBPyConnection
-        Conexión a DuckDB.
-    sql : str
-        Consulta SQL a ejecutar.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Resultado de la consulta o DataFrame vacío si falla.
-    """
     try:
         return con.execute(sql).fetchdf()
     except Exception:
         return pd.DataFrame()
 
+# --------------------------- Helpers ---------------------------
+# -------- Report: preparar y devolver contenido para descarga --------
+def prepare_report_download(con: duckdb.DuckDBPyConnection) -> tuple[str, bytes]:
+    """
+    Genera el informe HTML (usando app.report.assemble_report si existe)
+    y devuelve (nombre_archivo, contenido_bytes). NO se ejecuta salvo que tú la llames.
+    """
+    try:
+        from app.report import assemble_report
+    except Exception:
+        def assemble_report():
+            REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+            out = REPORTS_DIR / f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.html"
+            out.write_text("<html><body><h1>Reporte</h1><p>(dummy)</p></body></html>", encoding="utf-8")
+            print(f"Reporte generado: {out}")
+            return str(out)
 
-# -------- helpers UI/KPI --------
+    out_path = assemble_report()
+    with open(out_path, "rb") as f:
+        data = f.read()
+    return Path(out_path).name, data
+
+
+
+
 def last_run_info(con: duckdb.DuckDBPyConnection) -> dict:
     """
-    Recuperar información del último run registrado en `etl_runs`.
-
-    Parameters
-    ----------
-    con : duckdb.DuckDBPyConnection
-        Conexión a DuckDB.
-
-    Returns
-    -------
-    dict
-        Diccionario con claves: run_id, status, rows_total, finished_local.
-        Devuelve {} si no hay información disponible.
+    Devuelve info del último run. Si etl_runs.rows_total es NULL/0,
+    lo calcula como SUM(rows_loaded) en etl_metrics para ese run_id.
     """
     if not table_or_view_exists(con, "etl_runs"):
         return {}
@@ -165,7 +137,27 @@ def last_run_info(con: duckdb.DuckDBPyConnection) -> dict:
     """).fetchdf()
     if df.empty:
         return {}
+
     row = df.iloc[0]
+    run_id = row["run_id"]
+    status = row.get("status")
+
+    # rows_total “robusto”
+    rows_total = row.get("rows_total")
+    try:
+        rows_total_val = int(rows_total) if pd.notna(rows_total) else 0
+    except Exception:
+        rows_total_val = 0
+    if rows_total_val == 0 and table_or_view_exists(con, "etl_metrics"):
+        try:
+            rows_total_val = int(con.execute(
+                "SELECT COALESCE(SUM(rows_loaded),0) FROM etl_metrics WHERE run_id = ?",
+                [run_id]
+            ).fetchone()[0] or 0)
+        except Exception:
+            rows_total_val = 0
+
+    # fecha local
     finished = row.get("finished_at")
     try:
         if pd.isna(finished):
@@ -176,31 +168,17 @@ def last_run_info(con: duckdb.DuckDBPyConnection) -> dict:
             local_str = local_ts.strftime("%Y-%m-%d %H:%M:%S") + " (hora local)"
     except Exception:
         local_str = str(finished)
+
     return {
-        "run_id": row.get("run_id"),
-        "status": row.get("status"),
-        "rows_total": int(row.get("rows_total") or 0),
+        "run_id": run_id,
+        "status": status,
+        "rows_total": rows_total_val,
         "finished_local": local_str,
     }
 
 
 def sanitize_table_name(name: str) -> str:
-    """
-    Generar un nombre de tabla 'staging' seguro a partir de un nombre de fichero.
-
-    Parameters
-    ----------
-    name : str
-        Nombre del fichero (posiblemente con #hoja para Excel).
-
-    Returns
-    -------
-    str
-        Nombre de tabla seguro, prefijado con 'stg_'.
-    """
-    base = name
-    if "#" in base:
-        base = base.split("#", 1)[0]
+    base = name.split("#", 1)[0]
     base = Path(base).stem.lower()
     base = re.sub(r"[^a-z0-9_]+", "_", base)
     base = re.sub(r"_+", "_", base).strip("_")
@@ -208,28 +186,11 @@ def sanitize_table_name(name: str) -> str:
         base = "stg_table"
     return f"stg_{base}"
 
-
 def import_file_to_duckdb(con: duckdb.DuckDBPyConnection, path: Path) -> tuple[str, int]:
-    """
-    Importar un archivo CSV/TXT/XLSX/XLS como tabla staging en DuckDB.
-
-    Parameters
-    ----------
-    con : duckdb.DuckDBPyConnection
-        Conexión a DuckDB.
-    path : pathlib.Path
-        Ruta del archivo a importar.
-
-    Returns
-    -------
-    tuple[str, int]
-        (nombre_tabla, filas_importadas)
-    """
     fname = path.name
     table = sanitize_table_name(fname)
     p = str(path)
     sheet_name = None
-    # Soporte nombre tipo "archivo.xlsx#Hoja2"
     if "#" in fname and (fname.endswith(".xlsx") or fname.endswith(".xls")):
         base, sheet_name = fname.split("#", 1)
         path = path.with_name(base)
@@ -243,10 +204,7 @@ def import_file_to_duckdb(con: duckdb.DuckDBPyConnection, path: Path) -> tuple[s
         )
         con.execute(sql)
     elif fname.lower().endswith((".xlsx", ".xls")):
-        try:
-            df = pd.read_excel(p, sheet_name=(sheet_name or 0))
-        except Exception as e:
-            raise RuntimeError(f"No se pudo leer Excel: {e}")
+        df = pd.read_excel(p, sheet_name=(sheet_name or 0))
         con.register("df_tmp_import", df)
         con.execute(f"CREATE OR REPLACE TABLE {table} AS SELECT * FROM df_tmp_import")
         con.unregister("df_tmp_import")
@@ -256,53 +214,40 @@ def import_file_to_duckdb(con: duckdb.DuckDBPyConnection, path: Path) -> tuple[s
     n = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
     return table, int(n)
 
+# --------------------------- Informe (descarga bajo demanda) ---------------------------
 
-# -------- Report: solo descarga (robusto) --------
-def prepare_report_download(con: duckdb.DuckDBPyConnection) -> tuple[str, bytes]:
+def download_report_button(con: duckdb.DuckDBPyConnection):
     """
-    Preparar un informe HTML para descarga.
-
-    Intenta usar `assemble_report()` si existe en `app.report`. En caso de
-    no encontrarlo, genera un informe "dummy". El contenido binario y el
-    nombre se almacenan en `st.session_state` para evitar recomputaciones.
-
-    Parameters
-    ----------
-    con : duckdb.DuckDBPyConnection
-        Conexión a DuckDB (para conocer el último run).
-
-    Returns
-    -------
-    tuple[str, bytes]
-        (nombre_archivo, contenido_html_bytes)
+    Botón de descarga que genera el reporte SOLO cuando se pulsa.
+    No hay generación automática al renderizar la página.
     """
     try:
         from app.report import assemble_report
     except Exception:
-        def assemble_report():
+        assemble_report = None
+
+    if st.button("📄 Generar y descargar informe", use_container_width=True):
+        if assemble_report is None:
             REPORTS_DIR.mkdir(parents=True, exist_ok=True)
             out = REPORTS_DIR / f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.html"
             out.write_text("<html><body><h1>Reporte</h1><p>(dummy)</p></body></html>", encoding="utf-8")
-            print(f"Reporte generado: {out}")
-            return str(out)
+            data = out.read_bytes()
+            name = out.name
+        else:
+            out_path = assemble_report()
+            out = Path(out_path)
+            data = out.read_bytes()
+            name = out.name
+        st.download_button(
+            "⬇️ Descargar informe (HTML)",
+            data=data,
+            file_name=name,
+            mime="text/html",
+            use_container_width=True,
+        )
+        st.caption(f"Guardado también en: {out}")
 
-    # Genera SOLO si ha cambiado el último run_id (o nunca se generó)
-    info = last_run_info(con)
-    last_id = info.get("run_id", "none")
-    key_id = st.session_state.get("report_last_id")
-    if key_id != last_id or "report_bytes" not in st.session_state:
-        out_path = assemble_report()
-        with open(out_path, "rb") as f:
-            st.session_state["report_bytes"] = f.read()
-        st.session_state["report_name"] = Path(out_path).name
-        st.session_state["report_last_id"] = last_id
-
-    name = st.session_state.get("report_name", f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
-    data = st.session_state["report_bytes"]
-    return name, data
-
-
-# -------- vista: KPIs + CTAs + Uploader --------
+# --------------------------- Vistas ---------------------------
 def render_home(con: duckdb.DuckDBPyConnection):
     st.subheader("Cómo va mi tienda hoy")
 
@@ -318,6 +263,7 @@ def render_home(con: duckdb.DuckDBPyConnection):
     st.markdown("### Acciones rápidas")
     col_run, col_report = st.columns([1, 1])
 
+    # --- Botón Ejecutar hoy (siempre visible) ---
     with col_run:
         if st.button("▶ Ejecutar hoy", use_container_width=True, type="primary"):
             with st.status("Ejecutando grupo 'daily'…", expanded=True) as status:
@@ -325,44 +271,141 @@ def render_home(con: duckdb.DuckDBPyConnection):
                     from app.runner import run_group, load_yaml, ensure_ledger
                     ensure_ledger(DB_PATH)
                     cfg = load_yaml("config/sources.yml")
-                    dq = load_yaml("config/dq.yml")
-                    run_group("daily", cfg, dq)
-                    status.update(label="Runner OK", state="complete")
+                    dq  = load_yaml("config/dq.yml")
+                    result = run_group("daily", cfg, dq)  # "ok" / "fail"
+                    status.update(label=f"Runner OK (status={result})", state="complete")
                     st.success("Carga completada ✅")
-                except Exception:
+                except Exception as e:
+                    st.write("Fallo en modo librería, probamos subprocess…")
+                    st.code(str(e), language="text")
+                    env = os.environ.copy()
+                    env["PYTHONUTF8"] = "1"
+                    env["PYTHONIOENCODING"] = "utf-8"
                     res = subprocess.run(
                         [sys.executable, "-m", "app.runner", "--group", "daily"],
                         cwd=str(ROOT),
                         capture_output=True,
                         text=True,
+                        env=env,
                     )
                     if res.stdout:
                         st.code(res.stdout, language="bash")
                     if res.returncode != 0:
-                        status.update(label="Runner terminó con error", state="error")
+                        status.update(label="Runner terminó con error (subprocess)", state="error")
                         if res.stderr:
                             st.code(res.stderr, language="bash")
                         st.error("Fallo al ejecutar el runner.")
                     else:
-                        status.update(label="Runner OK", state="complete")
+                        status.update(label="Runner OK (subprocess)", state="complete")
                         st.success("Carga completada ✅")
+            # refresca métricas sin cerrar la conexión cacheada
             st.rerun()
 
+
+    # --- Informe: solo generar/servir al pulsar ---
     with col_report:
-        name, data = prepare_report_download(con)
-        st.download_button(
-            "📄 Descargar informe",
-            data=data,
-            file_name=name,
-            mime="text/html",
-            use_container_width=True,
-        )
+        # preparar/actualizar informe BAJO DEMANDA (no al cargar la página)
+        if st.button("📄 Preparar informe", use_container_width=True):
+            try:
+                name, data = prepare_report_download(con)
+                st.session_state["_report_ready"] = (name, data)
+                st.success("Informe preparado. Ahora puedes descargarlo.")
+            except Exception as e:
+                st.error(f"No se pudo preparar el informe: {e}")
+
+        if "_report_ready" in st.session_state:
+            name, data = st.session_state["_report_ready"]
+            st.download_button(
+                "⬇️ Descargar informe (HTML)",
+                data=data,
+                file_name=name,
+                mime="text/html",
+                use_container_width=True,
+            )
+    st.markdown("---")
+    st.subheader("Ventas — resumen rápido")
+    render_dashboard(con)
+
+
+# -------- Dash de ventas simple (auto-crea vistas si hay staging) --------
+def render_dashboard(con: duckdb.DuckDBPyConnection):
+    # 1) Si no existe la staging, mostramos ayuda
+    if not table_or_view_exists(con, "stg_fact_sales_order_items"):
+        st.info("Sube e importa tu fichero de ventas (CSV/XLSX) en la pestaña **Datos**. "
+                "La tabla esperada es **stg_fact_sales_order_items**.")
+        return
+
+    # 2) Asegura vistas mínimas (idempotente)
+    try:
+        con.execute("""
+            CREATE OR REPLACE VIEW vw_sales_items AS
+            SELECT
+              order_id,
+              order_item_id,
+              sku_id,
+              CAST(quantity_units AS BIGINT)      AS quantity,
+              CAST(line_total_eur AS DOUBLE)      AS revenue_eur,
+              CAST(discount_pct   AS DOUBLE)      AS discount_pct,
+              CAST(tax_pct        AS DOUBLE)      AS tax_pct,
+              promised_date,
+              shipped_date,
+              COALESCE(shipped_date, promised_date) AS order_date
+            FROM stg_fact_sales_order_items
+        """)
+        con.execute("""
+            CREATE OR REPLACE VIEW vw_sales_daily AS
+            SELECT
+              DATE_TRUNC('day', order_date)::DATE AS d,
+              SUM(revenue_eur)                    AS revenue_eur,
+              SUM(quantity)                       AS units,
+              COUNT(DISTINCT order_id)            AS orders
+            FROM vw_sales_items
+            WHERE order_date IS NOT NULL
+            GROUP BY 1
+            ORDER BY 1
+        """)
+        con.execute("""
+            CREATE OR REPLACE VIEW vw_top_sku AS
+            SELECT
+              sku_id,
+              SUM(revenue_eur) AS revenue_eur,
+              SUM(quantity)    AS units
+            FROM vw_sales_items
+            GROUP BY sku_id
+            ORDER BY revenue_eur DESC
+            LIMIT 10
+        """)
+    except Exception as e:
+        st.error(f"No se pudieron crear/actualizar las vistas de ventas: {e}")
+        return
+
+    # 3) KPIs
+    kpi = con.execute("""
+        SELECT
+          COALESCE(SUM(revenue_eur),0) AS revenue_eur,
+          COALESCE(SUM(quantity),0)    AS units,
+          COALESCE(COUNT(DISTINCT order_id),0) AS orders
+        FROM vw_sales_items
+    """).fetchdf()
+    c1, c2, c3 = st.columns(3)
+    with c1: st.metric("Ingresos totales (€)", f"{kpi.loc[0,'revenue_eur']:,.0f}".replace(",", "."))
+    with c2: st.metric("Unidades", f"{int(kpi.loc[0,'units']):,}".replace(",", "."))
+    with c3: st.metric("Pedidos", f"{int(kpi.loc[0,'orders']):,}".replace(",", "."))
+
+    # 4) Serie temporal
+    df_daily = con.execute("SELECT * FROM vw_sales_daily").fetchdf()
+    st.line_chart(df_daily.set_index("d")[["revenue_eur", "units"]])
+
+    # 5) Top SKUs
+    df_top = con.execute("SELECT * FROM vw_top_sku").fetchdf()
+    st.bar_chart(df_top.set_index("sku_id")[["revenue_eur"]])
+
 
 def render_data(con: duckdb.DuckDBPyConnection):
     st.subheader("Sube tus CSV/XLSX de ventas y mermas")
 
     uploaded = st.file_uploader(
-        "Arrastra aquí archivos CSV/TXT/XLSX/XLS",
+        "Arrastra aquí archivos CSV/TXT/XLSX/XLS (se guardan en data/input/)",
         type=["csv", "txt", "xlsx", "xls"],
         accept_multiple_files=True,
     )
@@ -370,29 +413,54 @@ def render_data(con: duckdb.DuckDBPyConnection):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         for uf in uploaded:
             dest = INPUT_DIR / f"{ts}_{uf.name}"
+            dest.parent.mkdir(parents=True, exist_ok=True)
             with open(dest, "wb") as f:
                 f.write(uf.getbuffer())
         st.toast("Archivo(s) guardado(s) en data/input/", icon="✅")
 
-    files = sorted(INPUT_DIR.glob("*.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    ALLOWED = {".csv", ".txt", ".xlsx", ".xls"}
+    files = sorted(
+        [p for p in INPUT_DIR.rglob("*") if p.is_file() and p.suffix.lower() in ALLOWED],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
     if files:
-        st.markdown("#### Archivos guardados")
-        for p in files[:20]:
-            cols = st.columns([4, 2, 2])
-            with cols[0]:
-                st.write(p.name)
-            with cols[1]:
-                tbl_name = sanitize_table_name(p.name)
-                if st.button(f"Importar a DuckDB → {tbl_name}", key=f"imp_{p.name}"):
+        if st.button("📥 Importar TODO a DuckDB (stg_*)", type="primary", use_container_width=True):
+            ok, err = 0, 0
+            for p in files:
+                try:
+                    import_file_to_duckdb(con, p)
+                    ok += 1
+                except Exception:
+                    err += 1
+            st.success(f"Importación masiva: {ok} ok, {err} con error.")
+            st.rerun()
+
+        st.markdown("#### Archivos guardados (incluye subcarpetas)")
+        for p in files[:50]:
+            c1, c2, c3, c4 = st.columns([5, 3, 2, 2])
+            with c1:
+                try:
+                    rel = p.relative_to(INPUT_DIR)
+                    st.write(str(rel))
+                except Exception:
+                    st.write(p.name)
+            with c2:
+                st.code(sanitize_table_name(p.name), language="bash")
+            with c3:
+                if st.button("Importar", key=f"imp_{p}"):
                     try:
                         table, n = import_file_to_duckdb(con, p)
-                        st.toast(f"Importadas {n} filas en {table}", icon="✅")
                         st.success(f"{table}: {n} filas")
                         st.rerun()
                     except Exception as e:
                         st.error(str(e))
-            with cols[2]:
+            with c4:
                 st.caption(f"{int(p.stat().st_size/1024)} KB")
+    else:
+        st.info("No hay archivos en data/input/ (puedes crear subcarpetas y arrastrar aquí).")
 
     st.markdown("#### Mis tablas")
     tdf = df_safe(con, """
@@ -412,17 +480,7 @@ def render_data(con: duckdb.DuckDBPyConnection):
             except Exception as e:
                 st.error(f"No se pudo leer {sel}: {e}")
 
-
-# -------- vistas secundarias --------
 def render_status(con: duckdb.DuckDBPyConnection):
-    """
-    Renderizar la pestaña de estado con runs y métricas recientes.
-
-    Parameters
-    ----------
-    con : duckdb.DuckDBPyConnection
-        Conexión a DuckDB.
-    """
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Últimos runs (etl_runs)")
@@ -457,17 +515,25 @@ def render_status(con: duckdb.DuckDBPyConnection):
     else:
         st.info("La vista v_etl_last no existe todavía (se crea desde app.status).")
 
-
 def render_explorer(con: duckdb.DuckDBPyConnection):
     """
-    Renderizar el explorador de tablas/vistas con previsualización.
-
-    Parameters
-    ----------
-    con : duckdb.DuckDBPyConnection
-        Conexión a DuckDB.
+    Explorador de tablas/vistas con preview y un pequeño SQL runner.
     """
+    # --- SQL runner (expander) ---
+    with st.expander("Consulta SQL (avanzado)", expanded=False):
+        default_sql = "SELECT CURRENT_TIMESTAMP AS now"
+        sql = st.text_area("Escribe tu SQL y ejecuta", value=default_sql, height=140, key="sql_textarea")
+        if st.button("▶ Ejecutar SQL", key="exec_sql_btn"):
+            try:
+                dfq = con.execute(sql).fetchdf()
+                st.dataframe(dfq, use_container_width=True, height=360)
+            except Exception as e:
+                st.error(f"Error SQL: {e}")
+
+    st.divider()
     st.subheader("Explorador de tablas/vistas")
+
+    # Listado de tablas y vistas
     tbls = con.execute("""
         SELECT table_name, table_type
         FROM information_schema.tables
@@ -478,11 +544,14 @@ def render_explorer(con: duckdb.DuckDBPyConnection):
         WHERE table_schema='main'
         ORDER BY table_type, table_name
     """).fetchdf().drop_duplicates(subset=["table_name"])
+
     if tbls.empty:
         st.info("No hay tablas ni vistas en 'main'.")
         return
+
     sel = st.selectbox("Selecciona", tbls["table_name"].tolist())
     n = st.slider("Filas a mostrar", 10, 2000, 200, step=10)
+
     if sel:
         try:
             df = con.execute(f"SELECT * FROM {sel} LIMIT {int(n)}").fetchdf()
@@ -491,50 +560,24 @@ def render_explorer(con: duckdb.DuckDBPyConnection):
             st.error(f"No se pudo leer {sel}: {e}")
 
 
-# -------- Modo seguro (conservado) --------
 def render_safe_mode():
     """
-    Renderizar la sección de modo seguro para ejecutar 'daily' mediante subprocess.
+    Modo seguro: ejecuta el runner SIEMPRE vía subprocess (sin modo librería),
+    con UTF-8 forzado. Evita choques con ensure_ledger.
     """
-    try:
-        settings = load_settings()  # si no existe, caerá al except
-    except Exception:
-        settings = {"paths": {"db_path": DB_PATH}}
-
     ROOT_L = Path(__file__).resolve().parents[1]
-    DBP = settings["paths"]["db_path"]
-
-    @st.cache_resource(show_spinner=False)
-    def _con():
-        """
-        Devolver una conexión DuckDB para la sección de modo seguro.
-
-        Returns
-        -------
-        duckdb.DuckDBPyConnection
-        """
-        return duckdb.connect(DBP)
 
     def _run_group_safe(group: str):
-        """
-        Ejecutar el runner en modo seguro como subproceso.
-
-        Parameters
-        ----------
-        group : str
-            Nombre del grupo a ejecutar.
-
-        Returns
-        -------
-        bool
-            True si finaliza con código 0, False en caso contrario.
-        """
         with st.status(f"Ejecutando '{group}'…", expanded=True) as s:
+            env = os.environ.copy()
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
             res = subprocess.run(
                 [sys.executable, "-m", "app.runner", "--group", group],
                 cwd=str(ROOT_L),
                 capture_output=True,
                 text=True,
+                env=env,
             )
             if res.stdout:
                 st.code(res.stdout, language="bash")
@@ -560,7 +603,7 @@ def render_safe_mode():
             st.rerun()
 
     try:
-        con = _con()
+        con = get_con()
         runs = con.execute("""
             SELECT run_id, started_at, finished_at, group_name, status, rows_total, duration_s
             FROM etl_runs ORDER BY started_at DESC LIMIT 10
@@ -569,25 +612,21 @@ def render_safe_mode():
     except Exception as e:
         st.info(f"No se pudieron leer KPIs: {e}")
 
+# --------------------------- Main ---------------------------
 
-# -------- main --------
 def main():
     con = get_con()
     tabs = st.tabs(["Inicio", "Estado", "Explorar", "Datos"])
 
     with tabs[0]:
         render_home(con)
-
     with tabs[1]:
         render_status(con)
         render_safe_mode()
-
     with tabs[2]:
         render_explorer(con)
-
     with tabs[3]:
         render_data(con)
-
 
 if __name__ == "__main__":
     main()
