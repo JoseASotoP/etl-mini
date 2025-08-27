@@ -36,3 +36,5 @@ data/backups/
 
 # Binarios
 *.zip
+
+!.env.example
