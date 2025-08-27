@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\JASOTO\ETL\etl-mini\app\runner.py", line 561, in <module>
+    main()
+  File "C:\Users\JASOTO\ETL\etl-mini\app\runner.py", line 554, in main
+    status = run_group(args.group, cfg, dq)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\JASOTO\ETL\etl-mini\app\runner.py", line 388, in run_group
+    ensure_ledger(db_path)
+  File "C:\Users\JASOTO\ETL\etl-mini\app\runner.py", line 67, in ensure_ledger
+    con.execute("""
+duckdb.duckdb.CatalogException: Catalog Error: Table with name "etl_runs" already exists!

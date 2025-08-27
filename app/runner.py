@@ -7,32 +7,15 @@ Runner de ETL por grupos con configuración YAML, DQ y ledger en DuckDB.
 Carga fuentes via adaptadores, aplica reglas de calidad (dq.yml) y registra
 métricas en tablas `etl_runs` y `etl_metrics`. Genera además un health JSON.
 
-Parameters
-----------
-None
-
-Returns
--------
-None
-    Módulo con punto de entrada CLI.
-
-Preconditions
---------------
-- Ficheros `config/sources.yml` y `config/dq.yml` legibles.
-- DuckDB accesible en la ruta configurada.
-- Adaptadores registrados en `app.adapters`.
-
-Example
---------
-$ python -m app.runner --group daily
-$ python -m app.runner --config config/sources.yml --dq config/dq.yml
+Ejemplos:
+    $ python -m app.runner --group daily
+    $ python -m app.runner --config config/sources.yml --dq config/dq.yml
 """
 
 import argparse
 import json
 import os
 import sys
-import time  # noqa: F401 (posible uso futuro)
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -40,95 +23,60 @@ import duckdb
 import pandas as pd
 import yaml
 
-# --- Lote 2: imports mínimos para fail-fast ---
 from app.utils import load_settings
 from .adapters.base import get_adapter
-# asegura el registro de adaptadores (efecto lateral import)
-from .adapters import csv_local, http_json  # noqa: F401
+from .adapters import csv_local, http_json  # noqa: F401  (registro de adaptadores)
 
 CONFIG_DEFAULT = "config/sources.yml"
 DQ_DEFAULT = "config/dq.yml"
 
 
-def ensure_ledger(db_path: str) -> None:
-    """
-    Crea tablas de control `etl_runs` y `etl_metrics` si no existen.
-
-    Parameters
-    ----------
-    db_path : str
-        Ruta al archivo DuckDB.
-
-    Returns
-    -------
-    None
-    """
+def ensure_ledger(db_path: str):
     con = duckdb.connect(db_path)
-    con.execute(
-        """
+    con.execute("""
         CREATE TABLE IF NOT EXISTS etl_runs (
-          run_id TEXT PRIMARY KEY,
-          started_at TIMESTAMP,
-          finished_at TIMESTAMP,
-          group_name TEXT,
-          status TEXT,
-          error TEXT,
-          sources_count INTEGER,
-          rows_total INTEGER,
-          duration_s DOUBLE
+            run_id       VARCHAR PRIMARY KEY,
+            started_at   TIMESTAMP,
+            finished_at  TIMESTAMP,
+            group_name   VARCHAR,
+            status       VARCHAR,
+            rows_total   BIGINT,
+            duration_s   DOUBLE
         )
-        """
-    )
-    con.execute(
-        """
+    """)
+    con.execute("""
         CREATE TABLE IF NOT EXISTS etl_metrics (
-          run_id TEXT,
-          source_name TEXT,
-          table_name TEXT,
-          rows_loaded INTEGER,
-          duration_s DOUBLE,
-          dq_pass BOOLEAN,
-          dq_violations INTEGER,
-          loaded_at TIMESTAMP  -- sello temporal de carga POR FUENTE
+            run_id         VARCHAR,
+            source_name    VARCHAR,
+            table_name     VARCHAR,
+            rows_loaded    BIGINT,
+            dq_pass        BOOLEAN,
+            dq_violations  INTEGER,
+            duration_s     DOUBLE,
+            loaded_at      TIMESTAMP
         )
-        """
-    )
+    """)
+    con.execute("""
+        CREATE VIEW IF NOT EXISTS v_etl_last AS
+        SELECT
+          table_name,
+          ANY_VALUE(source_name)   AS source_name,
+          MAX(loaded_at)           AS loaded_at,
+          ANY_VALUE(dq_pass)       AS dq_pass,
+          ANY_VALUE(dq_violations) AS dq_violations,
+          ANY_VALUE(rows_loaded)   AS rows_loaded
+        FROM etl_metrics
+        GROUP BY table_name
+    """)
     con.close()
 
 
 def load_yaml(path: str) -> Dict[str, Any]:
-    """
-    Carga un YAML a dict usando `yaml.safe_load`.
-
-    Parameters
-    ----------
-    path : str
-        Ruta del archivo YAML.
-
-    Returns
-    -------
-    Dict[str, Any]
-        Contenido del YAML o dict vacío si está vacío.
-    """
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
 def _table_exists(con: duckdb.DuckDBPyConnection, name: str) -> bool:
-    """
-    Verifica si existe una tabla en la base de datos.
-
-    Parameters
-    ----------
-    con : duckdb.DuckDBPyConnection
-        Conexión activa a DuckDB.
-    name : str
-        Nombre de la tabla.
-
-    Returns
-    -------
-    bool
-    """
     return bool(
         con.execute(
             "SELECT 1 FROM information_schema.tables "
@@ -143,26 +91,6 @@ def apply_dq(
     table: str,
     dq: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Valida un DataFrame según `dq.yml`. Devuelve pass/violations.
-
-    Soporta `schema` (casts: int/float/datetime/str) y `checks` de
-    `not_null`, `unique` y `range`.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Datos a validar.
-    table : str
-        Nombre lógico de la tabla para buscar reglas.
-    dq : Dict[str, Any]
-        Reglas cargadas desde `dq.yml`.
-
-    Returns
-    -------
-    Dict[str, Any]
-        {'pass': bool, 'violations': int, 'on_fail': 'warn'|'block'}
-    """
     rules = (dq.get("rules") or {}).get(table)
     result = {"pass": True, "violations": 0, "on_fail": "warn"}
     if not rules:
@@ -172,7 +100,6 @@ def apply_dq(
     checks = rules.get("checks") or []
     result["on_fail"] = rules.get("on_fail", "warn")
 
-    # casts
     dfc = df.copy()
     for col, typ in schema.items():
         if col not in dfc.columns:
@@ -214,20 +141,6 @@ def apply_dq(
 
 
 def _build_cast_select(src_table: str, cast_map: Dict[str, str] | None) -> str:
-    """
-    Devuelve un SELECT con TRY_CAST según cast_map o '*' si no se define.
-
-    Parameters
-    ----------
-    src_table : str
-        Nombre de la tabla staging.
-    cast_map : Dict[str, str] | None
-        Mapeo de columnas a tipos.
-
-    Returns
-    -------
-    str
-    """
     if not cast_map:
         return f"SELECT * FROM {src_table}"
     parts = [f"TRY_CAST({src_table}.{col} AS {typ}) AS {col}" for col, typ in cast_map.items()]
@@ -241,26 +154,6 @@ def incremental_upsert(
     key_cols: List[str],
     cast_map: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
-    """
-    Inserta solo filas nuevas de stage→dest usando dedupe por key_cols.
-
-    Parameters
-    ----------
-    con : duckdb.DuckDBPyConnection
-        Conexión activa.
-    stage_table : str
-        Nombre de la tabla staging.
-    dest_table : str
-        Nombre de la tabla destino.
-    key_cols : List[str]
-        Columnas clave para incremental.
-    cast_map : Dict[str, str] | None
-        Mapeo de casts.
-
-    Returns
-    -------
-    Dict[str, Any]
-    """
     if not key_cols:
         raise ValueError(f"Modo incremental requiere 'key' en YAML para {dest_table}")
 
@@ -318,22 +211,6 @@ def export_parquet(
     table: str,
     cfg: Dict[str, Any],
 ) -> str | None:
-    """
-    Exporta a parquet según cfg: {dir, overwrite, partition_by, export_sql?}.
-
-    Parameters
-    ----------
-    con : duckdb.DuckDBPyConnection
-        Conexión activa.
-    table : str
-        Nombre de la tabla.
-    cfg : Dict[str, Any]
-        Configuración.
-
-    Returns
-    -------
-    str | None
-    """
     dir_ = cfg.get("dir")
     if not dir_:
         return None
@@ -369,23 +246,6 @@ def run_group(
     config: Dict[str, Any],
     dq: Dict[str, Any],
 ) -> str:
-    """
-    Ejecuta un grupo de fuentes: extrae, valida y registra métricas.
-
-    Parameters
-    ----------
-    group : str
-        Nombre del grupo a ejecutar.
-    config : Dict[str, Any]
-        Configuración completa de `sources.yml`.
-    dq : Dict[str, Any]
-        Reglas de `dq.yml`.
-
-    Returns
-    -------
-    str
-        Estado final del run ("ok" | "fail").
-    """
     defaults = config.get("defaults") or {}
     db_path = defaults.get("db_path", "data/warehouse.duckdb")
     ensure_ledger(db_path)
@@ -394,18 +254,18 @@ def run_group(
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     started = datetime.now(timezone.utc)
 
-    # --- Lote 2: setup fail-fast ---
-    _settings = {}
+    # ajustes de runner / reportes
+    settings = {}
     try:
-        _settings = load_settings() or {}
+        settings = load_settings() or {}
     except Exception:
-        _settings = {}
-    _runner_cfg = _settings.get("runner") or {}
-    _paths_cfg = _settings.get("paths") or {}
-    _fail_fast = bool(_runner_cfg.get("fail_fast", False))
-    _dq_mode = (_runner_cfg.get("dq_report") or "html").lower()
-    _reports_dir = _paths_cfg.get("reports_dir", "data/reports")
-    os.makedirs(_reports_dir, exist_ok=True)
+        settings = {}
+    r_cfg = settings.get("runner") or {}
+    p_cfg = settings.get("paths") or {}
+    fail_fast = bool(r_cfg.get("fail_fast", False))
+    dq_mode = (r_cfg.get("dq_report") or "html").lower()
+    reports_dir = p_cfg.get("reports_dir", "data/reports")
+    os.makedirs(reports_dir, exist_ok=True)
 
     run_status = "ok"
     rows_total = 0
@@ -440,10 +300,9 @@ def run_group(
                 f"({dur:.2f}s) DQ pass={dq_pass} vio={dq_violations}"
             )
 
-            # --- Lote 2: reacción a DQ ---
             if not dq_pass:
-                if _dq_mode in ("html", "both"):
-                    dq_html_path = os.path.join(_reports_dir, f"dq_{name}_{run_id}.html")
+                if dq_mode in ("html", "both"):
+                    dq_html_path = os.path.join(reports_dir, f"dq_{name}_{run_id}.html")
                     try:
                         with open(dq_html_path, "w", encoding="utf-8") as _f:
                             _f.write(
@@ -459,7 +318,7 @@ def run_group(
                         print(f"[DQ-REPORT] WARN al escribir HTML: {_e}")
 
                 print(f"[DQ-FAIL] {table_name} violations={int(dq_violations)}")
-                if _fail_fast:
+                if fail_fast:
                     print("[ABORT] fail_fast=true — stopping group")
                     run_status = "fail"
                     break
@@ -487,37 +346,33 @@ def run_group(
     finished = datetime.now(timezone.utc)
     duration = (finished - started).total_seconds()
 
+    # --- Persistencia: dentro de la MISMA conexión y en el orden correcto ---
     con = duckdb.connect(db_path)
+
     if metrics_rows:
         con.register("df_metrics", pd.DataFrame(metrics_rows))
         con.execute(
             """
             INSERT INTO etl_metrics
-            SELECT run_id, source_name, table_name, rows_loaded,
-                   duration_s, dq_pass, dq_violations, loaded_at
+              (run_id, source_name, table_name, rows_loaded, dq_pass, dq_violations, duration_s, loaded_at)
+            SELECT run_id, source_name, table_name, rows_loaded, dq_pass, dq_violations, duration_s, loaded_at
             FROM df_metrics
             """
         )
+
     con.execute(
         """
         INSERT INTO etl_runs
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (run_id, started_at, finished_at, group_name, status, rows_total, duration_s)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        [
-            run_id,
-            started,
-            finished,
-            group,
-            run_status,
-            error_msg,
-            len(group_list),
-            rows_total,
-            duration,
-        ],
+        [run_id, started, finished, group, run_status, rows_total, duration],
     )
+
     con.close()
 
-    health_path = os.path.join(_reports_dir, f"health_{run_id}.json")
+    # Health JSON (informativo)
+    health_path = os.path.join(reports_dir, f"health_{run_id}.json")
     with open(health_path, "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -539,13 +394,6 @@ def run_group(
 
 
 def main() -> None:
-    """
-    Punto de entrada CLI para ejecutar un grupo con DQ y ledger.
-
-    Returns
-    -------
-    None
-    """
     ap = argparse.ArgumentParser(description="ETL Runner (config + DQ + ledger)")
     ap.add_argument("--config", default=CONFIG_DEFAULT, help="Ruta a sources.yml")
     ap.add_argument("--dq", default=DQ_DEFAULT, help="Ruta a dq.yml")
@@ -555,8 +403,6 @@ def main() -> None:
     cfg = load_yaml(args.config)
     dq = load_yaml(args.dq)
     status = run_group(args.group, cfg, dq)
-
-    # --- Lote 2: exit code ---
     sys.exit(0 if status == "ok" else 1)
 
 
