@@ -20,3 +20,19 @@ serve.cmd
 /data/input/**
 \!data/input/.gitkeep
 *.duckdb
+
+# --- Nítida ---
+# Logs y data locales
+data/logs/**
+!data/logs/.gitkeep
+data/input/**
+!data/input/.gitkeep
+*.duckdb
+data/backups/
+
+# Entornos y secretos
+.env
+.env.*
+
+# Binarios
+*.zip
