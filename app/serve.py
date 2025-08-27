@@ -12,7 +12,18 @@ Run:
     streamlit run app/serve.py
 """
 from __future__ import annotations
+# añade este import con fallback
+try:
+    from app.assistant import render_assistant
+    ASSISTANT_OK = True
+    ASSISTANT_ERR = ""
+except Exception as _e:
+    render_assistant = None
+    ASSISTANT_OK = False
+    ASSISTANT_ERR = str(_e)
 
+
+import io
 import os
 import sys
 import re
@@ -46,6 +57,16 @@ def get_settings() -> dict:
         except Exception:
             pass
     return DEFAULT_SETTINGS
+
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+def df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Datos") -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name=sheet_name)
+    buf.seek(0)
+    return buf.read()
 
 SET = get_settings()
 ROOT = Path(__file__).resolve().parents[1]
@@ -96,8 +117,58 @@ def df_safe(con: duckdb.DuckDBPyConnection, sql: str) -> pd.DataFrame:
         return con.execute(sql).fetchdf()
     except Exception:
         return pd.DataFrame()
+        
+def render_schema_graph(con: duckdb.DuckDBPyConnection):
+    st.subheader("Esquema de datos (auto)")
+    cols = con.execute("""
+        SELECT table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema='main'
+    """).fetchdf()
+
+    tables = set(cols["table_name"].unique())
+    edges = set()
+    for _, row in cols.iterrows():
+        t = row["table_name"]; c = row["column_name"]
+        if c.endswith("_id"):
+            base = c[:-3]
+            # heurística: dim_<base> o stg_<base>s
+            targets = [f"dim_{base}", f"stg_{base}s", f"{base}", f"{base}s"]
+            for tgt in targets:
+                if tgt in tables and tgt != t:
+                    edges.add((t, tgt))
+
+    dot = ["digraph G { rankdir=LR; node [shape=box, style=rounded];"]
+    for t in sorted(tables):
+        dot.append(f'"{t}";')
+    for a, b in sorted(edges):
+        dot.append(f'"{a}" -> "{b}";')
+    dot.append("}")
+    st.graphviz_chart("\n".join(dot), use_container_width=True)
 
 # --------------------------- Helpers ---------------------------
+def last_run_summary(con: duckdb.DuckDBPyConnection) -> str | None:
+    try:
+        q = """
+        WITH last AS (SELECT MAX(started_at) AS mx FROM etl_runs)
+        SELECT r.run_id,
+               COALESCE(SUM(m.rows_loaded),0) AS rows_loaded,
+               COUNT(m.table_name)            AS tables_loaded,
+               BOOL_AND(COALESCE(m.dq_pass, TRUE)) AS all_pass
+        FROM etl_runs r
+        LEFT JOIN etl_metrics m USING(run_id)
+        WHERE r.started_at = (SELECT mx FROM last)
+        GROUP BY r.run_id
+        """
+        df = con.execute(q).fetchdf()
+        if df.empty:
+            return None
+        row = df.iloc[0]
+        ok = "OK" if bool(row.get("all_pass", True)) else "con incidencias"
+        return f"Carga {row['run_id']}: {int(row['tables_loaded'])} tablas, {int(row['rows_loaded']):,} filas, DQ {ok}."
+    except Exception:
+        return None
+
 # -------- Report: preparar y devolver contenido para descarga --------
 def prepare_report_download(con: duckdb.DuckDBPyConnection) -> tuple[str, bytes]:
     """
@@ -249,7 +320,12 @@ def download_report_button(con: duckdb.DuckDBPyConnection):
 
 # --------------------------- Vistas ---------------------------
 def render_home(con: duckdb.DuckDBPyConnection):
-    st.subheader("Cómo va mi tienda hoy")
+    st.subheader("Panel")
+    with st.expander("¿Qué hace Nítida? (2 líneas)", expanded=False):
+            st.markdown("""
+            - **Automatiza**: ingesta de archivos/APIs → limpieza/normalización → tablas/vistas de negocio.
+            - **Audita**: guarda runs y métricas en `etl_runs`/`etl_metrics`. **Analiza**: panel, consultas SQL y asistente.
+            """)
 
     k = last_run_info(con)
     c1, c2, c3 = st.columns(3)
@@ -299,6 +375,10 @@ def render_home(con: duckdb.DuckDBPyConnection):
                         status.update(label="Runner OK (subprocess)", state="complete")
                         st.success("Carga completada ✅")
             # refresca métricas sin cerrar la conexión cacheada
+            resumen = last_run_summary(con)
+            if resumen:
+                st.success(resumen)
+
             st.rerun()
 
 
@@ -516,10 +596,6 @@ def render_status(con: duckdb.DuckDBPyConnection):
         st.info("La vista v_etl_last no existe todavía (se crea desde app.status).")
 
 def render_explorer(con: duckdb.DuckDBPyConnection):
-    """
-    Explorador de tablas/vistas con preview y un pequeño SQL runner.
-    """
-    # --- SQL runner (expander) ---
     with st.expander("Consulta SQL (avanzado)", expanded=False):
         default_sql = "SELECT CURRENT_TIMESTAMP AS now"
         sql = st.text_area("Escribe tu SQL y ejecuta", value=default_sql, height=140, key="sql_textarea")
@@ -533,7 +609,10 @@ def render_explorer(con: duckdb.DuckDBPyConnection):
     st.divider()
     st.subheader("Explorador de tablas/vistas")
 
-    # Listado de tablas y vistas
+    with st.expander("📈 Esquema (auto-grafo por *_id)", expanded=False):
+        render_schema_graph(con)
+
+    # Listado
     tbls = con.execute("""
         SELECT table_name, table_type
         FROM information_schema.tables
@@ -556,6 +635,28 @@ def render_explorer(con: duckdb.DuckDBPyConnection):
         try:
             df = con.execute(f"SELECT * FROM {sel} LIMIT {int(n)}").fetchdf()
             st.dataframe(df, use_container_width=True, height=420)
+
+            with st.expander("🔎 Perfil rápido (hasta 5.000 filas)", expanded=False):
+                samp = con.execute(f"SELECT * FROM {sel} LIMIT 5000").fetchdf()
+                prof = pd.DataFrame({
+                    "col": samp.columns,
+                    "dtype": [str(samp[c].dtype) for c in samp.columns],
+                    "nulls": [int(samp[c].isna().sum()) for c in samp.columns],
+                    "distinct": [int(samp[c].nunique(dropna=True)) for c in samp.columns],
+                })
+                st.dataframe(prof, use_container_width=True, hide_index=True, height=260)
+
+            # Exportar
+            csv_b = df_to_csv_bytes(df)
+            xlsx_b = df_to_xlsx_bytes(df, sheet_name=sel)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button("⬇️ Exportar CSV", data=csv_b, file_name=f"{sel}.csv", mime="text/csv", use_container_width=True)
+            with c2:
+                st.download_button("⬇️ Exportar Excel", data=xlsx_b, file_name=f"{sel}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   use_container_width=True)
+
         except Exception as e:
             st.error(f"No se pudo leer {sel}: {e}")
 
@@ -616,17 +717,33 @@ def render_safe_mode():
 
 def main():
     con = get_con()
-    tabs = st.tabs(["Inicio", "Estado", "Explorar", "Datos"])
 
-    with tabs[0]:
+    t_home, t_status, t_explorer, t_data, t_assistant = st.tabs(
+        ["Panel", "Estado", "Consultas", "Subir y limpiar", "Asistente"]
+    )
+
+    with t_home:
         render_home(con)
-    with tabs[1]:
+
+    with t_status:
         render_status(con)
         render_safe_mode()
-    with tabs[2]:
+
+    with t_explorer:
         render_explorer(con)
-    with tabs[3]:
+
+    with t_data:
         render_data(con)
+
+    with t_assistant:
+        if ASSISTANT_OK and callable(render_assistant):
+            render_assistant(con)
+        else:
+            st.error("No se pudo cargar el asistente.")
+            if ASSISTANT_ERR:
+                st.caption(f"Detalle: {ASSISTANT_ERR}")
+            st.info("Verifica `app/assistant.py` y dependencias.")
+
 
 if __name__ == "__main__":
     main()

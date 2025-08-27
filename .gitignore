@@ -13,3 +13,10 @@ serve.cmd
 # DB leftovers
 /data/*.wal
 /data/*.db
+
+# Nítida
+/data/logs/
+*.log
+/data/input/**
+\!data/input/.gitkeep
+*.duckdb
