@@ -1,43 +1,45 @@
 # -*- coding: utf-8 -*-
 """
-Asistente LLM para Nítida — v0.5.0 MVP
+Asistente LLM para Nítida — v0.5.0 (con Mini-Planner)
 
 - Pestaña "Asistente" conversa en lenguaje natural.
-- Genera SQL SEGURO (solo SELECT) sobre tablas/vistas permitidas.
-- Ejecuta en DuckDB con LIMIT/timeout y muestra tabla + gráfico.
+- Modo 1: Consulta única → genera SQL SEGURO (solo SELECT) sobre tablas/vistas permitidas.
+- Modo 2: Análisis (mini-planner) → produce 2–3 consultas (KPIs, serie temporal, Top SKU),
+  ejecuta en DuckDB con LIMIT/timeout, dibuja múltiples gráficos y genera narrativa.
 - Fallback sin API key con plantillas típicas (top-N, series diarias, etc.).
-- Log de actividad: data/logs/assistant.log
+- Logs en: data/logs/assistant.log
 
 Requisitos:
     pip install langchain langchain-openai openai tiktoken altair
 """
 
 from __future__ import annotations
-import io
-
-def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
-
-def df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Datos") -> bytes:
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name=sheet_name)
-    buf.seek(0)
-    return buf.read()
-
 
 import os
 import re
 import json
+from dataclasses import dataclass
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 
 import duckdb
 import pandas as pd
 import altair as alt
 import streamlit as st
 
-# --- LangChain ---
+import re, datetime as dt
+from dataclasses import dataclass
+from typing import Dict, Any, List, Optional, Tuple
+
+DIM_SYNONYMS = {
+    "sku": ["sku", "producto", "artículo", "item"],
+    "customer_id": ["cliente", "account", "buyer"],
+    "region_id": ["región", "region", "país", "pais", "country"],
+    "channel_id": ["canal", "channel", "marketplace"]
+}
+
+
+# --- LangChain (opcional) ---
 try:
     from langchain_openai import ChatOpenAI
     from langchain.prompts import ChatPromptTemplate
@@ -49,20 +51,24 @@ LOG_DIR = Path("data/logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "assistant.log"
 
-# ===== Seguridad / utilidades =====
+# ======== Seguridad / utilidades SQL ========
 
 DEFAULT_ALLOWED = [
-    "vw_sales_items",
-    "vw_sales_daily",
-    "vw_top_sku",
-    "stg_fact_sales_order_items",
-    "vw_big_sales_daily", 
+    # Vistas del dashboard base:
+    "vw_sales_items",       # (order_id, sku_id, quantity, revenue_eur, order_date, ...)
+    "vw_sales_daily",       # (d, revenue_eur, units, orders)
+    "vw_top_sku",           # (sku_id, revenue_eur, units)
+    # Vistas/datos de los datasets grandes (si existen):
     "vw_fact_sales_big2m",
-    "stg_fact_sales_big2m", 
-    "stg_fact_sales_wide"
+    "vw_big_sales_daily",
+    "stg_fact_sales_big2m",
+    "stg_fact_sales_wide",
 ]
 
-DDL_FORBIDDEN = re.compile(r"\b(DROP|ALTER|TRUNCATE|CREATE|REPLACE|INSERT|UPDATE|DELETE|ATTACH|DETACH|COPY|PRAGMA)\b", re.I)
+DDL_FORBIDDEN = re.compile(
+    r"\b(DROP|ALTER|TRUNCATE|CREATE|REPLACE|INSERT|UPDATE|DELETE|ATTACH|DETACH|COPY|PRAGMA)\b",
+    re.I,
+)
 MULTISTMT = re.compile(r";\s*\S", re.S)
 
 def _log(event: dict):
@@ -74,12 +80,14 @@ def _log(event: dict):
         pass
 
 def _introspect_schema(con: duckdb.DuckDBPyConnection, allowed: list[str]) -> str:
-    q = """
+    if not allowed:
+        return ""
+    q = f"""
     SELECT table_name, column_name, data_type
     FROM information_schema.columns
-    WHERE table_schema='main' AND table_name IN ({})
+    WHERE table_schema='main' AND table_name IN ({",".join("'" + t + "'" for t in allowed)})
     ORDER BY table_name, ordinal_position
-    """.format(",".join("'" + t + "'" for t in allowed))
+    """
     try:
         df = con.execute(q).fetchdf()
         if df.empty:
@@ -100,54 +108,41 @@ def sanitize_sql(sql: str, allowed: list[str], default_limit: int = 1000) -> str
     Reglas:
     - una sola sentencia
     - solo SELECT
-    - solo tablas allowed
+    - sin DDL/DML peligrosos
+    - si menciona tablas explícitas tras FROM/JOIN, deben estar en allowlist
     - LIMIT obligatorio
     """
     if not sql:
         raise ValueError("SQL vacío.")
 
-    # Una sola sentencia
     s = sql.strip().rstrip(";")
     if MULTISTMT.search(sql):
         raise ValueError("No se permite ejecutar múltiples sentencias.")
-    # Solo SELECT
     if not re.match(r"^\s*SELECT\b", s, re.I):
         raise ValueError("Solo se permite SELECT.")
     if DDL_FORBIDDEN.search(s):
         raise ValueError("Comando no permitido en el SQL.")
-    # Tablas permitidas
-    idents = set(re.findall(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b", s))
-    # muy simple: si menciona alguna tabla que no esté en allowlist, bloquea
-    tables_mentioned = [tok for tok in idents if tok.lower() not in {
-        "select","from","where","group","by","order","limit","and","or","desc","asc","distinct","on","join","left","right","inner","outer",
-        "as","sum","avg","min","max","count","date_trunc","date_part","cast","coalesce","case","when","then","else","end",
-        "in","not","between","like","ilike","having","over","partition","rows","range","current","row","preceding","following",
-        "true","false","null","is"
-    }]
-    # si menciona al menos una tabla, todas deben estar permitidas
-    if tables_mentioned:
-        for t in tables_mentioned:
+
+    # Validar tablas si aparecen literal en FROM/JOIN
+    for kw in ("FROM", "JOIN"):
+        for m in re.finditer(rf"\b{kw}\s+([a-zA-Z_][a-zA-Z0-9_]*)", s, re.I):
+            t = m.group(1)
             if t not in allowed:
-                # puede ser un alias; comprobación relajada: si aparece exacto en FROM/JOIN, validamos
-                if re.search(rf"\bFROM\s+{t}\b", s, re.I) or re.search(rf"\bJOIN\s+{t}\b", s, re.I):
-                    if t not in allowed:
-                        raise ValueError(f"Tabla no permitida: {t}")
-    # LIMIT
+                raise ValueError(f"Tabla no permitida: {t}")
+
     if not re.search(r"\bLIMIT\b", s, re.I):
         s = f"{s}\nLIMIT {default_limit}"
     return s
 
-def run_select(con: duckdb.DuckDBPyConnection, sql: str, timeout_ms: int = 5000) -> pd.DataFrame:
-    
+def run_select(con: duckdb.DuckDBPyConnection, sql: str, timeout_ms: int = 6000) -> pd.DataFrame:
+
     return con.execute(sql).fetchdf()
 
-
-
-# ===== Fallback “plantillas” sin LLM =====
+# ======== Plantillas simplificadas (sin LLM) ========
 
 def template_sql(prompt: str) -> str | None:
     """
-    Reglas heurísticas muy simples para casos típicos si no hay LLM:
+    Heurísticas muy simples si no hay LLM:
     """
     p = prompt.lower()
     if "top" in p and ("sku" in p or "producto" in p):
@@ -168,7 +163,7 @@ def template_sql(prompt: str) -> str | None:
         return "SELECT * FROM vw_sales_items LIMIT 1000"
     return None
 
-# ===== LLM -> SQL =====
+# ======== LLM → SQL (consulta única) ========
 
 SYSTEM_PROMPT = """Eres un asistente de analítica.
 Devuelves SIEMPRE una única consulta SQL válida para DuckDB, enfocada en negocio.
@@ -183,340 +178,697 @@ Esquema permitido:
 
 def llm_to_sql(prompt: str, schema_text: str, model_name: str = "gpt-4o-mini") -> str:
     if ChatOpenAI is None or os.getenv("OPENAI_API_KEY") in (None, ""):
-        # Sin LLM -> plantillas
         sql = template_sql(prompt)
         if sql:
             return sql
-        # fallback final
         raise RuntimeError("Sin LLM y sin plantilla aplicable. Sé más específico (ej.: 'Top 10 SKUs por ingresos').")
 
-    llm = ChatOpenAI(model=model_name, temperature=0.1)
-    tmpl = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
-        ("user", "{question}"),
-    ])
-    chain = tmpl | llm
-    out = chain.invoke({
-        "schema": schema_text,
-        "question": prompt
-    })
-    text = out.content if hasattr(out, "content") else str(out)
-    # intenta extraer bloque SQL; si no, usa todo el texto
-    m = re.search(r"```sql\s*(.*?)```", text, re.S|re.I)
-    sql = m.group(1).strip() if m else text.strip()
-    return sql
+    try:
+        llm = ChatOpenAI(model=model_name, temperature=0.1)
+        tmpl = ChatPromptTemplate.from_messages([
+            ("system", SYSTEM_PROMPT),
+            ("user", "{question}"),
+        ])
+        chain = tmpl | llm
+        out = chain.invoke({"schema": schema_text, "question": prompt})
+        text = out.content if hasattr(out, "content") else str(out)
+        m = re.search(r"```sql\s*(.*?)```", text, re.S|re.I)
+        sql = m.group(1).strip() if m else text.strip()
+        return sql
+    except Exception as e:
+        # Si falla la llamada (key inválida, red, etc.), intenta plantilla
+        sql = template_sql(prompt)
+        if sql:
+            return sql
+        raise RuntimeError(f"No se pudo usar el LLM: {e}")
 
-# ===== Gráficos automáticos =====
+# ======== Charts básicos ========
 
 def auto_chart(df: pd.DataFrame, title: str = ""):
     """
-    Reglas simples:
-    - Si hay columna 'd' (date) y numéricas -> línea temporal
-    - Si hay 'sku_id' + una numérica -> barras top-N
-    - Si no, tabla (Streamlit mostrará dataframe)
+    Reglas:
+    - Si hay 'd' (fecha) + numéricas → línea temporal.
+    - Si hay 'sku_id' + numérica → barras top.
+    - Si no, None (Streamlit muestra tabla).
     """
     if df is None or df.empty:
         return None
 
-    # d como fecha
-    if "d" in df.columns and pd.api.types.is_datetime64_any_dtype(df["d"]) or "d" in df.columns and df["d"].dtype == "object":
-        cands = [c for c in df.columns if c != "d" and pd.api.types.is_numeric_dtype(df[c])]
-        if cands:
+    if "d" in df.columns:
+        try:
             data = df.copy()
-            try:
-                data["d"] = pd.to_datetime(data["d"])
-            except Exception:
-                pass
-            y = cands[0]
-            chart = alt.Chart(data).mark_line().encode(
-                x="d:T",
-                y=f"{y}:Q",
-                tooltip=list(data.columns)
-            ).properties(height=280, title=title or y)
-            return chart
+            data["d"] = pd.to_datetime(data["d"])
+            cands = [c for c in data.columns if c != "d" and pd.api.types.is_numeric_dtype(data[c])]
+            if cands:
+                y = cands[0]
+                return alt.Chart(data).mark_line().encode(
+                    x="d:T",
+                    y=f"{y}:Q",
+                    tooltip=list(data.columns),
+                ).properties(height=280, title=title or y)
+        except Exception:
+            pass
 
-    # sku_id barras
     if "sku_id" in df.columns:
         cands = [c for c in df.columns if c != "sku_id" and pd.api.types.is_numeric_dtype(df[c])]
         if cands:
             y = cands[0]
             data = df.sort_values(y, ascending=False).head(20)
-            chart = alt.Chart(data).mark_bar().encode(
+            return alt.Chart(data).mark_bar().encode(
                 x=f"{y}:Q",
                 y=alt.Y("sku_id:N", sort="-x"),
-                tooltip=list(data.columns)
+                tooltip=list(data.columns),
             ).properties(height=360, title=title or y)
-            return chart
 
-    return None  # Streamlit mostrará tabla
+    return None
 
-# ===== Utils =============
-# ----------- Ayudas de esquema / vistas disponibles -----------------
+# ======== Mini-Planner ========
 
-def view_exists(con: duckdb.DuckDBPyConnection, name: str) -> bool:
-    try:
-        q = """
-        SELECT 1
-        FROM information_schema.tables
-        WHERE table_schema='main' AND table_name=?
+@dataclass
+class Filters:
+    start: str | None = None   # ISO date (YYYY-MM-DD)
+    end: str | None = None     # ISO date (YYYY-MM-DD), exclusive
+    last_days: int | None = None
+    year: int | None = None
+
+def parse_filters(prompt: str) -> Filters:
+    """Extrae 'últimos N días' o 'año 202X' de forma simple."""
+    p = prompt.lower()
+
+    # últimos N días
+    m = re.search(r"(últimos|ultimos|last)\s+(\d+)\s+(días|dias|days)", p)
+    if m:
+        n = int(m.group(2))
+        return Filters(last_days=n)
+
+    # año 20xx
+    m2 = re.search(r"\b(20\d{2})\b", p)
+    if m2:
+        y = int(m2.group(1))
+        return Filters(year=y)
+
+    return Filters()
+
+def _date_clause(col: str, flt: Filters) -> str:
+    if flt.last_days:
+        return f"{col} >= CURRENT_DATE - INTERVAL '{int(flt.last_days)} days'"
+    if flt.year:
+        y = int(flt.year)
+        return f"{col} >= DATE '{y}-01-01' AND {col} < DATE '{y+1}-01-01'"
+    return "TRUE"
+
+def tables_available(con: duckdb.DuckDBPyConnection) -> set[str]:
+    rows = con.execute("""
+        SELECT table_name FROM information_schema.tables WHERE table_schema='main'
         UNION ALL
-        SELECT 1
-        FROM information_schema.views
-        WHERE table_schema='main' AND table_name=?
-        LIMIT 1
-        """
-        return con.execute(q, [name, name]).fetchone() is not None
-    except Exception:
-        return False
+        SELECT table_name FROM information_schema.views  WHERE table_schema='main'
+    """).fetchall()
+    return {r[0] for r in rows}
 
-def pick_daily_view(con: duckdb.DuckDBPyConnection) -> str | None:
-    # Preferencias: vista de ventas diaria "grande" si existe, si no la estándar
-    for v in ["vw_big_sales_daily", "vw_sales_daily"]:
-        if view_exists(con, v):
-            return v
-    # Último recurso: derivar de vw_sales_items si existe
-    if view_exists(con, "vw_sales_items"):
-        return "__derive_from_items__"
-    return None
+@dataclass
+class PlanQuery:
+    title: str
+    sql: str
+    kind: str  # "kpi" | "series" | "top"
 
-# ----------- Intentos NL mínimos (sin LLM) -----------------
+def build_plan(con: duckdb.DuckDBPyConnection, prompt: str, allowed: list[str]) -> list[PlanQuery]:
+    """
+    Construye 2–3 consultas según lo disponible.
+    Preferencias:
+      - KPIs desde vw_sales_items (orders) o vw_sales_daily (sin orders)
+      - Serie temporal desde vw_sales_daily o vw_big_sales_daily
+      - Top SKU desde vw_sales_items o vw_fact_sales_big2m
+    """
+    avail = tables_available(con)
+    flt = parse_filters(prompt)
 
-def detect_intent(prompt: str) -> str | None:
-    p = (prompt or "").strip().lower()
-    if not p:
-        return None
-    if any(k in p for k in ["overview", "resumen", "análisis", "analisis", "general"]):
-        return "overview"
-    if any(k in p for k in ["media", "promedio"]) and any(k in p for k in ["último mes","ultimo mes","30 días","30 dias"]):
-        return "avg_last_month"
-    if "top" in p and ("sku" in p or "producto" in p):
-        return "top_skus"
-    return None
+    # Helpers de fecha por columna
+    items_date_col = "order_date"
+    daily_date_col = "d"
+    big_date_col   = "promised_date"
 
-# ----------- Narrativa (LLM opcional) -----------------
+    plan: list[PlanQuery] = []
 
-def narrate(spanish_bullets: list[str]) -> str:
-    """Si hay OpenAI, pulimos texto; si no, devolvemos viñetas."""
-    bullets_text = "\n".join(f"- {b}" for b in spanish_bullets)
-    api = os.getenv("OPENAI_API_KEY")
-    try:
-        if api and ChatOpenAI is not None:
-            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
-            prompt = ChatPromptTemplate.from_template(
-                "Eres analista. Reescribe en un párrafo breve y claro, en español, estas conclusiones de negocio:\n{bullets}"
-            )
-            out = (prompt | llm).invoke({"bullets": bullets_text})
-            return out.content if hasattr(out, "content") else str(out)
-    except Exception:
-        pass
-    return bullets_text
-
-# ----------- Blocks de ejecución por intención -----------------
-
-def block_overview(con: duckdb.DuckDBPyConnection, days: int = 30):
-    """KPIs + serie + top skus últimos N días."""
-    base = pick_daily_view(con)
-    if base is None:
-        st.error("No encuentro una vista diaria de ventas (vw_big_sales_daily, vw_sales_daily) ni vw_sales_items para derivarla.")
-        return
-
-    # Serie diaria
-    if base == "__derive_from_items__":
-        df_daily = con.execute(f"""
-            SELECT DATE_TRUNC('day', order_date)::DATE AS d,
-                   SUM(revenue_eur) AS revenue_eur,
-                   SUM(quantity)    AS units,
-                   COUNT(DISTINCT order_id) AS orders
+    # 1) KPIs (revenue, units, orders si hay)
+    if "vw_sales_items" in avail:
+        where = _date_clause(items_date_col, flt)
+        plan.append(PlanQuery(
+            title="KPIs (ventas)",
+            kind="kpi",
+            sql=f"""
+            SELECT
+              SUM(revenue_eur)                      AS revenue_eur,
+              SUM(quantity)                         AS units,
+              COUNT(DISTINCT order_id)              AS orders
             FROM vw_sales_items
-            WHERE order_date >= CURRENT_DATE - INTERVAL '{days*2} days'
-            GROUP BY 1
-            ORDER BY 1
-        """).fetchdf()
-    else:
-        df_daily = con.execute(f"""
-            SELECT d, revenue_eur, units,
-                   COALESCE(orders, NULL) AS orders
-            FROM {base}
-            WHERE d >= CURRENT_DATE - INTERVAL '{days*2} days'
+            WHERE {where}
+            """
+        ))
+    elif "vw_sales_daily" in avail:
+        where = _date_clause(daily_date_col, flt)
+        plan.append(PlanQuery(
+            title="KPIs (ventas diarias agregadas)",
+            kind="kpi",
+            sql=f"""
+            SELECT
+              SUM(revenue_eur) AS revenue_eur,
+              SUM(units)       AS units,
+              NULL::BIGINT     AS orders
+            FROM vw_sales_daily
+            WHERE {where}
+            """
+        ))
+    elif "vw_fact_sales_big2m" in avail:
+        where = _date_clause(big_date_col, flt)
+        plan.append(PlanQuery(
+            title="KPIs (ventas big2m)",
+            kind="kpi",
+            sql=f"""
+            SELECT
+              SUM(line_total_eur)                   AS revenue_eur,
+              SUM(quantity_units)                   AS units,
+              NULL::BIGINT                          AS orders
+            FROM vw_fact_sales_big2m
+            WHERE {where}
+            """
+        ))
+
+    # 2) Serie temporal
+    if "vw_sales_daily" in avail:
+        where = _date_clause(daily_date_col, flt)
+        plan.append(PlanQuery(
+            title="Serie diaria — revenue",
+            kind="series",
+            sql=f"""
+            SELECT d, revenue_eur, units, orders
+            FROM vw_sales_daily
+            WHERE {where}
             ORDER BY d
-        """).fetchdf()
+            """
+        ))
+    elif "vw_big_sales_daily" in avail:
+        where = _date_clause(daily_date_col, flt)
+        plan.append(PlanQuery(
+            title="Serie diaria — revenue (big)",
+            kind="series",
+            sql=f"""
+            SELECT d, revenue_eur, units
+            FROM vw_big_sales_daily
+            WHERE {where}
+            ORDER BY d
+            """
+        ))
 
-    if df_daily.empty:
-        st.info("No hay datos recientes para construir el resumen.")
-        return
-
-    # Ventana reciente vs anterior (N días)
-    cut = df_daily["d"].max() - pd.Timedelta(days=days-1)
-    recent = df_daily[df_daily["d"] >= cut]
-    previous = df_daily[(df_daily["d"] < cut) & (df_daily["d"] >= cut - pd.Timedelta(days=days))]
-
-    def agg(df):
-        return {
-            "revenue": float(df["revenue_eur"].sum()) if "revenue_eur" in df else 0.0,
-            "units":   float(df["units"].sum()) if "units" in df else 0.0,
-            "orders":  float(df["orders"].sum()) if "orders" in df else float("nan"),
-            "avg_rev_day": float(df["revenue_eur"].mean()) if "revenue_eur" in df else 0.0,
-        }
-    R, P = agg(recent), agg(previous)
-
-    # KPIs
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Ingresos (últimos 30d)", f"{R['revenue']:,.0f} €".replace(",", "."), 
-              delta=f"{((R['revenue']-P['revenue'])/P['revenue']*100):.1f} %" if P['revenue'] else None)
-    c2.metric("Unidades (30d)", f"{R['units']:,.0f}".replace(",", "."))
-    if not pd.isna(R["orders"]):
-        c3.metric("Pedidos (30d)", f"{R['orders']:,.0f}".replace(",", "."))
-    c4.metric("Media diaria €", f"{R['avg_rev_day']:,.0f} €".replace(",", "."))
-
-    # Gráfico serie
-    try:
-        df_daily["d"] = pd.to_datetime(df_daily["d"])
-    except Exception:
-        pass
-    chart = alt.Chart(df_daily).mark_line().encode(
-        x="d:T", y="revenue_eur:Q", tooltip=list(df_daily.columns)
-    ).properties(height=260, title=f"Ventas diarias (últimos {days*2} días)")
-    st.altair_chart(chart, use_container_width=True)
-
-    # Top SKUs últimos N días (si está la vista items)
-    if view_exists(con, "vw_sales_items"):
-        df_top = con.execute(f"""
+    # 3) Top SKU
+    if "vw_sales_items" in avail:
+        where = _date_clause(items_date_col, flt)
+        plan.append(PlanQuery(
+            title="Top 10 SKU por ingresos",
+            kind="top",
+            sql=f"""
             SELECT sku_id,
                    SUM(revenue_eur) AS revenue_eur,
                    SUM(quantity)    AS units
             FROM vw_sales_items
-            WHERE order_date >= CURRENT_DATE - INTERVAL '{days} days'
-            GROUP BY 1
+            WHERE {where}
+            GROUP BY sku_id
             ORDER BY revenue_eur DESC
-            LIMIT 5
-        """).fetchdf()
-        if not df_top.empty:
-            st.dataframe(df_top, use_container_width=True, hide_index=True)
-            top_chart = alt.Chart(df_top.sort_values("revenue_eur", ascending=True)).mark_bar().encode(
-                x="revenue_eur:Q", y=alt.Y("sku_id:N", sort="-x"), tooltip=list(df_top.columns)
-            ).properties(height=220, title="Top 5 SKUs por ingresos (30d)")
-            st.altair_chart(top_chart, use_container_width=True)
+            LIMIT 10
+            """
+        ))
+    elif "vw_fact_sales_big2m" in avail:
+        where = _date_clause(big_date_col, flt)
+        plan.append(PlanQuery(
+            title="Top 10 SKU por ingresos (big2m)",
+            kind="top",
+            sql=f"""
+            SELECT sku_id,
+                   SUM(line_total_eur) AS revenue_eur,
+                   SUM(quantity_units) AS units
+            FROM vw_fact_sales_big2m
+            WHERE {where}
+            GROUP BY sku_id
+            ORDER BY revenue_eur DESC
+            LIMIT 10
+            """
+        ))
 
-    # Narrativa
-    bullets = [
-        f"Ingresos últimos {days} días: {R['revenue']:,.0f} €.",
-        f"Media diaria: {R['avg_rev_day']:,.0f} €.",
-    ]
-    if P["revenue"]:
-        bullets.append(f"Variación vs período anterior: {((R['revenue']-P['revenue'])/P['revenue']*100):.1f} %.")    
-    if not pd.isna(R["orders"]):
-        bullets.append(f"Pedidos estimados en el período: {R['orders']:,.0f}.")
-    st.markdown(narrate(bullets))
+    # Filtra solo las que referencian tablas permitidas
+    filtered: list[PlanQuery] = []
+    for q in plan:
+        try:
+            _ = sanitize_sql(q.sql, allowed, default_limit=2000000)  # no imponemos LIMIT en agregados
+            filtered.append(q)
+        except Exception:
+            continue
 
-def block_avg_last_month(con: duckdb.DuckDBPyConnection, days: int = 30):
-    """Media de ventas (ingresos diarios) últimos N días."""
-    base = pick_daily_view(con)
-    if base is None:
-        st.error("No encuentro una vista diaria de ventas para calcular la media.")
-        return
+    # Si por lo que sea no hay nada, devolvemos algo genérico para no dejar vacío
+    if not filtered and "vw_sales_daily" in avail:
+        filtered = [PlanQuery(
+            title="Serie diaria (fallback)",
+            kind="series",
+            sql="SELECT d, revenue_eur, units FROM vw_sales_daily ORDER BY d LIMIT 3650"
+        )]
 
-    if base == "__derive_from_items__":
-        df = con.execute(f"""
-            SELECT DATE_TRUNC('day', order_date)::DATE AS d,
-                   SUM(revenue_eur) AS revenue_eur
-            FROM vw_sales_items
-            WHERE order_date >= CURRENT_DATE - INTERVAL '{days} days'
-            GROUP BY 1
-            ORDER BY 1
-        """).fetchdf()
-    else:
-        df = con.execute(f"""
-            SELECT d, revenue_eur
-            FROM {base}
-            WHERE d >= CURRENT_DATE - INTERVAL '{days} days'
-            ORDER BY d
-        """).fetchdf()
+    return filtered[:3]  # como máximo 3
 
-    if df.empty:
-        st.info("No hay datos para el último mes.")
-        return
+def narrate_from_results(prompt: str, dfs: dict[str, pd.DataFrame]) -> str:
+    """
+    Genera narrativa. Si hay LLM, resume con contexto;
+    si no, compone un texto basado en estadísticas simples.
+    """
+    # Heurística local
+    def num(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
 
+    revenue, units, orders = None, None, None
+    if "kpi" in dfs and not dfs["kpi"].empty:
+        row = dfs["kpi"].iloc[0]
+        revenue = num(row.get("revenue_eur"))
+        units   = num(row.get("units"))
+        orders  = num(row.get("orders"))
+
+    trend = ""
+    if "series" in dfs and not dfs["series"].empty:
+        s = dfs["series"]
+        try:
+            s["d"] = pd.to_datetime(s["d"])
+            s = s.sort_values("d")
+            if "revenue_eur" in s.columns:
+                last = s["revenue_eur"].tail(7).sum()
+                prev = s["revenue_eur"].tail(14).head(7).sum()
+                if prev and prev != 0:
+                    pct = (last - prev) / prev * 100.0
+                    trend = f"La última semana la facturación sumó {last:,.0f}€, {pct:+.1f}% vs la semana previa."
+        except Exception:
+            pass
+
+    base_text = "Análisis general: "
+    parts = []
+    if revenue is not None:
+        parts.append(f"Ingresos totales ≈ {revenue:,.0f}€")
+    if units is not None:
+        parts.append(f"unidades ≈ {units:,.0f}")
+    if orders is not None:
+        parts.append(f"pedidos ≈ {orders:,.0f}")
+    if trend:
+        parts.append(trend)
+
+    summary_local = base_text + ("; ".join(parts) if parts else "consulta ejecutada.")
+    use_llm = (ChatOpenAI is not None and os.getenv("OPENAI_API_KEY"))
+
+    if not use_llm:
+        return summary_local
+
+    # LLM: genera una narrativa de 4-6 frases
     try:
-        df["d"] = pd.to_datetime(df["d"])
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+        schema_hint = ", ".join(k for k in dfs.keys() if not dfs[k].empty)
+        few_rows = {}
+        for k, df in dfs.items():
+            few_rows[k] = df.head(10).to_dict(orient="records")
+
+        prompt_tmpl = ChatPromptTemplate.from_messages([
+            ("system",
+             "Eres un analista de datos. Resume de forma clara y accionable los resultados. "
+             "Ton profesional, 4–6 frases, menciona cifras relevantes y, si procede, variaciones recientes."),
+            ("user",
+             "Petición del usuario: {user_prompt}\n"
+             "Resultados disponibles: {tables}\n"
+             "Muestras JSON (hasta 10 filas por tabla):\n{samples}\n"
+             "Escribe un resumen breve y útil.")
+        ])
+        out = (prompt_tmpl | llm).invoke({
+            "user_prompt": prompt,
+            "tables": schema_hint,
+            "samples": json.dumps(few_rows, ensure_ascii=False)[:6000],  # límite prudente
+        })
+        text = out.content if hasattr(out, "content") else str(out)
+        return text.strip()
     except Exception:
-        pass
+        return summary_local
 
-    avg_rev = float(df["revenue_eur"].mean())
-    st.metric(f"Media diaria de ventas (últimos {days} días)", f"{avg_rev:,.0f} €".replace(",", "."))
-    ch = alt.Chart(df).mark_line().encode(x="d:T", y="revenue_eur:Q").properties(height=260, title="Serie diaria (últimos 30d)")
-    st.altair_chart(ch, use_container_width=True)
+# ======== UI Principal ========
 
-    st.markdown(narrate([
-        f"La media diaria de ingresos en los últimos {days} días es {avg_rev:,.0f} €.",
-        "La línea muestra la tendencia durante el periodo."
-    ]))
-
-
-
-# ===== UI de pestaña =====
 def render_assistant(con: duckdb.DuckDBPyConnection, allowed_tables: list[str] | None = None):
     st.subheader("Asistente (LLM)")
 
-    allowed = allowed_tables or DEFAULT_ALLOWED
+    # Allowlist dinámica (intersección de DEFAULT_ALLOWED con lo existente)
+    avail = tables_available(con)
+    allowed = [t for t in (allowed_tables or DEFAULT_ALLOWED) if t in avail]
     schema_text = _introspect_schema(con, allowed)
 
     with st.expander("Ayuda / qué puedo pedir", expanded=False):
         st.markdown(
             "- *“Top 10 SKUs por ingresos.”*\n"
             "- *“Ventas por día en los últimos 30 días.”*\n"
-            "- *“Unidades y pedidos por mes en 2024.”*\n"
-            "- *“Análisis general”* o *“Resumen”* (últimos 30d).\n"
-            "- *“Media de ventas del último mes”*."
+            "- *“Análisis general de 2024.”*\n"
+            "- *“Comparativa última semana vs anterior.”*"
         )
-        st.caption("Si no configuras OPENAI_API_KEY, el asistente usará plantillas básicas.")
+        st.caption("Si no configuras OPENAI_API_KEY, se usarán plantillas y el planner local.")
+
+    # Selector de modo
+    mode = st.radio(
+        "Modo",
+        ["Consulta única (SQL)", "Análisis (planner clásico)", "Análisis avanzado"],
+        index=1,
+        horizontal=True,
+    )
 
     c1, c2 = st.columns([3,1])
     with c1:
-        user_prompt = st.text_area("Escribe tu petición:", height=100, placeholder="Ej.: Análisis general… / Media de ventas del último mes…")
+        user_prompt = st.text_area("Escribe tu petición:", height=100,
+                                   placeholder="Ej.: Análisis general 2024; Top 10 SKU últimos 30 días; …")
     with c2:
         model = st.selectbox("Modelo", ["gpt-4o-mini (OpenAI)", "Plantillas locales"], index=0 if os.getenv("OPENAI_API_KEY") else 1)
 
     if st.button("► Ejecutar", type="primary"):
         started = datetime.now()
-        try:
-            # 1) Intento NL sin SQL (bloques listos)
-            intent = detect_intent(user_prompt)
-            if intent == "overview":
-                block_overview(con, days=30)
-                _log({"ok": True, "prompt": user_prompt, "mode":"overview"})
-                return
-            elif intent == "avg_last_month":
-                block_avg_last_month(con, days=30)
-                _log({"ok": True, "prompt": user_prompt, "mode":"avg_last_month"})
-                return
+        executed_ok = False
 
-            # 2) Si no hay intención “pre-hecha”, usamos LLM→SQL o plantillas previas:
-            use_llm = (model.startswith("gpt-") and os.getenv("OPENAI_API_KEY"))
-            sql_raw = llm_to_sql(user_prompt, schema_text, model_name="gpt-4o-mini") if use_llm else (template_sql(user_prompt) or "")
-            if not sql_raw:
-                raise ValueError("SQL vacío.")
-            sql = sanitize_sql(sql_raw, allowed, default_limit=1000)
-            df = run_select(con, sql, timeout_ms=5000)
-            if "d" in df.columns:
-                try:
-                    df["d"] = pd.to_datetime(df["d"])
-                except Exception:
-                    pass
-            st.code(sql, language="sql")
-            st.dataframe(df, use_container_width=True, hide_index=True, height=300)
-            chart = auto_chart(df)
-            if chart is not None:
-                st.altair_chart(chart, use_container_width=True)
+        if mode == "Consulta única (SQL)":
+            try:
+                use_llm = (model.startswith("gpt-") and os.getenv("OPENAI_API_KEY"))
+                sql_raw = llm_to_sql(user_prompt, schema_text, model_name="gpt-4o-mini") if use_llm else (template_sql(user_prompt) or "")
+                sql = sanitize_sql(sql_raw, allowed, default_limit=1000)
+                df = run_select(con, sql, timeout_ms=6000)
+                if "d" in df.columns:
+                    with pd.option_context("mode.chained_assignment", None):
+                        try: df["d"] = pd.to_datetime(df["d"])
+                        except Exception: pass
+                st.code(sql, language="sql")
+                st.dataframe(df, use_container_width=True, hide_index=True, height=320)
+                ch = auto_chart(df)
+                if ch is not None:
+                    st.altair_chart(ch, use_container_width=True)
+                executed_ok = True
+                _log({"ok": True, "mode":"single", "prompt": user_prompt, "sql": sql,
+                      "rows": int(len(df)), "ms": int((datetime.now()-started).total_seconds()*1000),
+                      "llm": bool(use_llm)})
+            except Exception as e:
+                st.error(f"No se pudo ejecutar tu petición: {e}")
+                _log({"ok": False, "mode":"single", "prompt": user_prompt, "error": str(e)})
 
-            _log({
-                "ok": True,
-                "prompt": user_prompt,
-                "sql": sql,
-                "rows": int(len(df)),
-                "ms": int((datetime.now() - started).total_seconds()*1000),
-                "llm": bool(use_llm)
-            })
+        elif mode == "Análisis (planner clásico)":
+            try:
+                plan = build_plan(con, user_prompt, allowed)
+                if not plan:
+                    raise RuntimeError("No se pudo construir un plan de análisis con las tablas disponibles.")
 
-        except Exception as e:
-            st.error(f"No se pudo ejecutar tu petición: {e}")
-            _log({"ok": False, "prompt": user_prompt, "error": str(e)})
+                tabs = st.tabs([p.title for p in plan])
+                results: dict[str, pd.DataFrame] = {}
+                for (p, tab) in zip(plan, tabs):
+                    with tab:
+                        try:
+                            sql = sanitize_sql(p.sql, allowed, default_limit=2000000)  # agregados: sin límite duro
+                            df = run_select(con, sql, timeout_ms=8000)
+                            # normaliza fecha si procede
+                            if "d" in df.columns:
+                                with pd.option_context("mode.chained_assignment", None):
+                                    try: df["d"] = pd.to_datetime(df["d"])
+                                    except Exception: pass
+                            st.code(sql, language="sql")
+                            st.dataframe(df, use_container_width=True, hide_index=True, height=280)
+                            ch = auto_chart(df, title=p.title)
+                            if ch is not None:
+                                st.altair_chart(ch, use_container_width=True)
+                            results[p.kind] = df
+                        except Exception as e:
+                            st.warning(f"No se pudo ejecutar '{p.title}': {e}")
+
+                # Narrativa (en bloque aparte)
+                st.markdown("### Narrativa")
+                story = narrate_from_results(user_prompt, results)
+                st.write(story)
+
+                executed_ok = True
+                _log({"ok": True, "mode":"planner", "prompt": user_prompt,
+                      "parts": [p.kind for p in plan],
+                      "ms": int((datetime.now()-started).total_seconds()*1000)})
+            except Exception as e:
+                st.error(f"No se pudo completar el análisis: {e}")
+                _log({"ok": False, "mode":"planner", "prompt": user_prompt, "error": str(e)})
+                
+        elif mode == "Análisis avanzado":
+            try:
+                run_plan(con, user_prompt, st, model_label=model)
+            except Exception as e:
+                st.error(f"No se pudo ejecutar el análisis avanzado: {e}")
+
+
+
+@dataclass
+class Scope:
+    start: dt.date
+    end: dt.date            # end exclusivo
+    dim: Optional[str]      # 'sku', 'customer_id', etc.
+    intent: List[str]       # ['kpis','series','compare','drivers','anomalies','dow']
+    top_n: int = 10
+
+# --------- parsing sencillo de rango temporal en español ---------
+def parse_time_window(text: str, today: Optional[dt.date] = None) -> Tuple[dt.date, dt.date]:
+    t = (today or dt.date.today())
+    s = text.lower()
+
+    # últimos X días/meses
+    m = re.search(r"últim[oa]s?\s+(\d+)\s*(d[ií]as?)", s)
+    if m:
+        n = int(m.group(1)); start = t - dt.timedelta(days=n); return start, t + dt.timedelta(days=1)
+
+    m = re.search(r"últim[oa]s?\s+(\d+)\s*mes", s)
+    if m:
+        n = int(m.group(1)); start = (t.replace(day=1) - dt.timedelta(days=1))
+        for _ in range(n-1): start = (start.replace(day=1) - dt.timedelta(days=1))
+        start = start.replace(day=1)
+        return start, t + dt.timedelta(days=1)
+
+    # “este año”, “2024”, “año 2024”
+    if "este año" in s or "este anio" in s:
+        start = dt.date(t.year,1,1); end = dt.date(t.year+1,1,1); return start, end
+    m = re.search(r"(?:año|ano)?\s*(20\d{2})", s)
+    if m:
+        y = int(m.group(1)); return dt.date(y,1,1), dt.date(y+1,1,1)
+
+    # “Q3 2025”
+    qm = re.search(r"q([1-4])\s*(20\d{2})", s)
+    if qm:
+        q = int(qm.group(1)); y = int(qm.group(2))
+        start = dt.date(y, 3*(q-1)+1, 1)
+        qend_month = 3*q+1
+        end = dt.date(y+1,1,1) if qend_month==13 else dt.date(y, qend_month, 1)
+        return start, end
+
+    # “desde 2024-04-01 a 2024-08-31”
+    m = re.search(r"desde\s*(\d{4}-\d{2}-\d{2})\s*(?:a|hasta)\s*(\d{4}-\d{2}-\d{2})", s)
+    if m:
+        start = dt.date.fromisoformat(m.group(1)); end = dt.date.fromisoformat(m.group(2)) + dt.timedelta(days=1)
+        return start, end
+
+    # por defecto: últimos 30 días
+    return t - dt.timedelta(days=30), t + dt.timedelta(days=1)
+
+def detect_dimension(text: str) -> Optional[str]:
+    s = text.lower()
+    for dim, keys in DIM_SYNONYMS.items():
+        if any(k in s for k in keys): return dim
+    return None
+
+def detect_intents(text: str) -> List[str]:
+    s = text.lower()
+    intents = []
+    # base
+    intents += ["kpis","series","top"]
+    # extensiones según palabras
+    if any(w in s for w in ["compar", "vs", "frente", "respecto"]): intents.append("compare")
+    if any(w in s for w in ["driver", "caída", "caidas", "subida", "ganadores", "perdedores", "motores"]): intents.append("drivers")
+    if any(w in s for w in ["anomal", "pico", "spike"]): intents.append("anomalies")
+    if any(w in s for w in ["semana", "dow", "día de la semana", "dia de la semana"]): intents.append("dow")
+    return list(dict.fromkeys(intents))
+
+def make_scope(prompt: str) -> Scope:
+    start, end = parse_time_window(prompt)
+    dim = detect_dimension(prompt) or "sku"  # por defecto sku
+    intents = detect_intents(prompt)
+    m = re.search(r"top\s*(\d+)", prompt.lower())
+    top_n = int(m.group(1)) if m else 10
+    return Scope(start, end, dim, intents, top_n)
+
+# ------------------ SQL helpers ------------------
+
+def where_between(col: str) -> str:
+    return f"{col} >= ? AND {col} < ?"
+
+def kpis_sql(extra_where: str = "") -> str:
+    return f"""
+WITH cur AS (
+  SELECT SUM(revenue_eur) AS rev, SUM(quantity) AS units, COUNT(DISTINCT order_id) AS orders
+  FROM vw_sales_items
+  WHERE {where_between('order_date')} {extra_where}
+),
+prev AS (
+  SELECT SUM(revenue_eur) AS rev, SUM(quantity) AS units, COUNT(DISTINCT order_id) AS orders
+  FROM vw_sales_items
+  WHERE {where_between('order_date')} {extra_where}
+)
+SELECT cur.rev, cur.units, cur.orders,
+       prev.rev AS prev_rev, prev.units AS prev_units, prev.orders AS prev_orders,
+       (cur.rev - prev.rev) AS delta_rev,
+       100.0*(cur.rev - prev.rev)/NULLIF(prev.rev,0) AS pct_rev
+FROM cur, prev;
+"""
+
+def series_sql(extra_where: str = "", grain: str = "day") -> str:
+    # usamos la vista ya diaria para simplificar y la filtramos
+    return f"""
+SELECT d, revenue_eur, units, orders
+FROM vw_sales_daily
+WHERE {where_between('d')} {extra_where}
+ORDER BY d
+LIMIT 2000000;
+"""
+
+def top_dim_sql(dim: str, extra_where: str = "", limit: int = 10) -> str:
+    return f"""
+SELECT {dim} AS dim,
+       SUM(revenue_eur) AS revenue_eur,
+       SUM(quantity)    AS units
+FROM vw_sales_items
+WHERE {where_between('order_date')} {extra_where}
+GROUP BY 1
+ORDER BY revenue_eur DESC
+LIMIT {limit};
+"""
+
+def drivers_sql(dim: str, extra_where: str = "", limit: int = 10) -> str:
+    # compara periodo vs anterior (misma duración)
+    return f"""
+WITH cur AS (
+  SELECT {dim} AS dim, SUM(revenue_eur) AS rev
+  FROM vw_sales_items
+  WHERE {where_between('order_date')} {extra_where}
+  GROUP BY 1
+),
+prev AS (
+  SELECT {dim} AS dim, SUM(revenue_eur) AS rev
+  FROM vw_sales_items
+  WHERE {where_between('order_date')} {extra_where}
+  GROUP BY 1
+),
+both AS (
+  SELECT dim, SUM(CASE WHEN tag='cur' THEN rev ELSE 0 END) AS rev_cur,
+             SUM(CASE WHEN tag='prev' THEN rev ELSE 0 END) AS rev_prev
+  FROM (
+    SELECT 'cur' AS tag, * FROM cur
+    UNION ALL
+    SELECT 'prev' AS tag, * FROM prev
+  )
+  GROUP BY 1
+)
+SELECT dim, rev_cur, rev_prev, (rev_cur - rev_prev) AS diff
+FROM both
+ORDER BY diff DESC
+LIMIT {limit};
+"""
+
+def anomalies_sql(extra_where: str = "") -> str:
+    return f"""
+WITH ts AS (
+  SELECT d, revenue_eur
+  FROM vw_sales_daily
+  WHERE {where_between('d')} {extra_where}
+  ORDER BY d
+),
+s AS (
+  SELECT d, revenue_eur,
+         AVG(revenue_eur) OVER (ORDER BY d ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING) AS ma30,
+         STDDEV_SAMP(revenue_eur) OVER (ORDER BY d ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING) AS sd30
+  FROM ts
+)
+SELECT d, revenue_eur, ma30, sd30,
+       (revenue_eur - ma30)/NULLIF(sd30,0) AS z
+FROM s
+WHERE sd30 IS NOT NULL AND ABS((revenue_eur - ma30)/NULLIF(sd30,0)) >= 3
+ORDER BY ABS(z) DESC
+LIMIT 20;
+"""
+
+def dow_sql(extra_where: str = "") -> str:
+    return f"""
+SELECT STRFTIME(d, '%w')::INTEGER AS dow,
+       AVG(revenue_eur) AS avg_rev, AVG(units) AS avg_units, AVG(orders) AS avg_orders
+FROM vw_sales_daily
+WHERE {where_between('d')} {extra_where}
+GROUP BY 1
+ORDER BY 1;
+"""
+
+# ----------------- ejecución y render -----------------
+
+def run_plan(con, prompt: str, st, model_label: str = "gpt-4o-mini (OpenAI)"):
+    scope = make_scope(prompt)
+    start, end = scope.start, scope.end
+    prev_len = end - start
+    prev_start = start - prev_len
+    prev_end   = start
+
+    # filtros extra (placeholder para cuando filtremos por canal/cliente específicos)
+    extra = ""  # e.g. " AND channel_id = ?"
+
+    st.caption(f"Ventana: {start} → {end-dt.timedelta(days=1)}  |  Dimensión: **{scope.dim}**  |  Modelo: {model_label}")
+
+    # --- KPIs ---
+    if "kpis" in scope.intent:
+        sql = kpis_sql(extra)
+        df = con.execute(sql, [start, end, prev_start, prev_end]).df()
+        st.subheader("KPIs (periodo vs previo)")
+        st.dataframe(df, hide_index=True, use_container_width=True)
+
+    # --- Serie ---
+    if "series" in scope.intent:
+        sql = series_sql(extra)
+        ts = con.execute(sql, [start, end]).df()
+        st.subheader("Serie diaria — revenue")
+        st.line_chart(ts.set_index("d")["revenue_eur"])
+
+    # --- Top N dimensión ---
+    if "top" in scope.intent:
+        sql = top_dim_sql(scope.dim, extra, scope.top_n)
+        topdf = con.execute(sql, [start, end]).df()
+        st.subheader(f"Top {scope.top_n} por ingresos — {scope.dim}")
+        st.bar_chart(topdf.set_index("dim")["revenue_eur"])
+
+    # --- Drivers (ganadores) ---
+    if "drivers" in scope.intent:
+        st.subheader(f"Drivers (∆ ingresos vs periodo anterior) — {scope.dim}")
+        gains = con.execute(drivers_sql(scope.dim, extra, scope.top_n), [start, end, prev_start, prev_end]).df()
+        st.dataframe(gains, hide_index=True, use_container_width=True)
+
+    # --- Anomalías ---
+    if "anomalies" in scope.intent:
+        an = con.execute(anomalies_sql(extra), [start, end]).df()
+        st.subheader("Anomalías (|z| ≥ 3)")
+        st.dataframe(an, hide_index=True, use_container_width=True)
+
+    # --- Día de semana ---
+    if "dow" in scope.intent:
+        dow = con.execute(dow_sql(extra), [start, end]).df()
+        st.subheader("Estacionalidad por día de semana (0=Dom, 6=Sáb)")
+        st.bar_chart(dow.set_index("dow")["avg_rev"])
+
+    # --- Narrativa simple ---
+    st.markdown("### Narrativa")
+    narr = []
+    if "kpis" in scope.intent and 'df' in locals():
+        rev = float(df.loc[0, 'rev']); prv = float(df.loc[0,'prev_rev'] or 0.0)
+        pct = float(df.loc[0,'pct_rev'] or 0.0)
+        narr.append(f"Ingresos del periodo: **{rev:,.0f} €**, variación vs anterior: **{pct:+.1f}%**.")
+    if "top" in scope.intent and not topdf.empty:
+        first = topdf.iloc[0]
+        narr.append(f"Top {scope.dim}: **{first['dim']}** (~{first['revenue_eur']:,.0f} €).")
+    if "anomalies" in scope.intent and not an.empty:
+        d0 = an.iloc[0]['d']; z0 = an.iloc[0]['z']
+        narr.append(f"Mayor anomalía: **{d0}** (z≈{z0:.1f}).")
+    st.write(" ".join(narr) if narr else "Sin hallazgos destacados.")
